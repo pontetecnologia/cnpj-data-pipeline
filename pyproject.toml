@@ -9,6 +9,8 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "polars>=1.0.0,<2.0.0",
     "pyarrow>=17.0.0,<24.0.0",
+    # exportar_prospeccao.py lê o Parquet com DuckDB
+    "duckdb>=1.1.0,<3.0.0",
 ]
 
 [project.scripts]
@@ -23,6 +25,8 @@ build-backend = "hatchling.build"
 only-include = [
     "file_types.py", "config.py", "database.py", "downloader.py", "processor.py", "parquet_writer.py", "main.py",
     "initial.sql",
+    # Adaptação GestaoRevenda (prospecção)
+    "filtro.py", "estado_prospeccao.py", "exportar_prospeccao.py",
 ]
 
 [tool.pytest.ini_options]

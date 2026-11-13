@@ -10,6 +10,7 @@ RUN uv export --locked --no-dev --no-emit-project -o /tmp/requirements.txt \
     && rm /tmp/requirements.txt
 
 COPY file_types.py config.py database.py downloader.py processor.py parquet_writer.py main.py ./
+COPY filtro.py estado_prospeccao.py exportar_prospeccao.py ./
 COPY initial.sql ./
 RUN uv pip install --system --no-deps -e .
 

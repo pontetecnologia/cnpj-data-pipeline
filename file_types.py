@@ -121,6 +121,15 @@ DEPENDENCY_GROUPS = [
     ["ESTABELE", "SOCIOCSV", "SIMPLESCSV"],  # depends on empresas
 ]
 
+# With the prospecting filter on (filtro.py), estabelecimentos is loaded first so that
+# empresas/dados_simples can be restricted to the cnpj_basico values that survived it.
+# socios is not loaded at all.
+FILTERED_DEPENDENCY_GROUPS = [
+    DEPENDENCY_GROUPS[0],  # references
+    ["ESTABELE"],  # filtered estabelecimentos
+    ["EMPRECSV", "SIMPLESCSV"],  # restricted to the filtered cnpj_basico set
+]
+
 # Flat processing order derived from dependency groups (for sorting)
 PROCESSING_ORDER = [ft for group in DEPENDENCY_GROUPS for ft in group]
 
@@ -156,14 +165,18 @@ def get_file_priority(filename: str) -> int:
     return 999
 
 
-def group_files_by_dependency(files: list[str]) -> list[list[str]]:
-    """Group pending files by dependency level. Returns ordered list of groups."""
-    groups: list[list[str]] = [[] for _ in DEPENDENCY_GROUPS]
+def group_files_by_dependency(files: list[str], dependency_groups: list[list[str]] | None = None) -> list[list[str]]:
+    """Group pending files by dependency level. Returns ordered list of groups.
+
+    Files whose type is in no group are dropped (used by the filtered layout to skip socios).
+    """
+    dependency_groups = DEPENDENCY_GROUPS if dependency_groups is None else dependency_groups
+    groups: list[list[str]] = [[] for _ in dependency_groups]
     for f in files:
         file_type = get_zip_file_type(f)
         if not file_type:
             continue
-        for i, dep_types in enumerate(DEPENDENCY_GROUPS):
+        for i, dep_types in enumerate(dependency_groups):
             if file_type in dep_types:
                 groups[i].append(f)
                 break

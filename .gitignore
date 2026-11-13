@@ -8,3 +8,7 @@ parquet/
 .pytest_cache/
 .coverage
 coverage.xml
+# Prospecção GestaoRevenda: estado local, CSVs gerados e logs
+estado/
+saida/
+logs/

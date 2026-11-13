@@ -89,13 +89,22 @@ class TableStats:
 class ParquetWriter:
     """Streams DataFrames to single Parquet files per table."""
 
-    def __init__(self, output_dir: str | Path, *, source_month: str | None = None, typed: bool = False):
+    def __init__(
+        self,
+        output_dir: str | Path,
+        *,
+        source_month: str | None = None,
+        typed: bool = False,
+        extra_provenance: dict[str, str] | None = None,
+    ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.provenance = {
             "cnpj.sourceMonth": source_month or "",
             "cnpj.schemaVersion": SCHEMA_VERSION,
             "cnpj.typed": str(typed).lower(),
+            # e.g. the prospecting filter signature: resuming with a different filter must fail
+            **(extra_provenance or {}),
         }
         self.stats: dict[str, TableStats] = {}
         self._writers: dict[str, pq.ParquetWriter] = {}

@@ -74,6 +74,16 @@ class Database:
             conn.rollback()
             raise
 
+    def fetch_rows(self, sql: str, params: tuple = ()) -> list[tuple]:
+        """Run a read-only query and return all rows (used by the prospecting filter)."""
+        conn = self.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                return cur.fetchall()
+        finally:
+            conn.rollback()
+
     def get_processed_files(self, directory: str) -> set[str]:
         """Get all processed filenames for a directory."""
         conn = self.connect()
