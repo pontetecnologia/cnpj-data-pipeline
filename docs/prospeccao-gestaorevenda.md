@@ -104,7 +104,7 @@ perdida" nas propriedades da tarefa).
 ## Roteiro de teste
 
 Pré-requisitos: Docker rodando, `.venv` criado (`python -m venv .venv` e
-`.venv\Scripts\python -m pip install -e . duckdb`), `.env` configurado.
+`.venv\Scripts\python -m pip install -e .`), `.env` configurado.
 
 ### A. Pipeline sem envio (seguro — não toca no GestaoRevenda)
 
