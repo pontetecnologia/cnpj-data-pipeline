@@ -26,7 +26,7 @@ only-include = [
     "file_types.py", "config.py", "database.py", "downloader.py", "processor.py", "parquet_writer.py", "main.py",
     "initial.sql",
     # Adaptação GestaoRevenda (prospecção)
-    "filtro.py", "estado_prospeccao.py", "exportar_prospeccao.py",
+    "filtro.py", "estado_prospeccao.py", "exportar_prospeccao.py", "enviar_gestaorevenda.py", "rodar_mensal.py",
 ]
 
 [tool.pytest.ini_options]

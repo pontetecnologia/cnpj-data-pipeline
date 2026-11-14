@@ -447,8 +447,9 @@ def main(
 ) -> str | None:
     """Main pipeline entry point. Returns the processed month (None for --list / nothing pending).
 
-    `filtro` defaults to the prospecting filter from the environment (PROSPECCAO_FILTRO); when it is
-    off this is exactly the upstream behavior.
+    From the command line (no `cfg`), the prospecting filter comes from the environment
+    (PROSPECCAO_FILTRO). A caller passing `cfg` passes `filtro` explicitly too (rodar_mensal does);
+    without it the run is exactly the upstream behavior, whatever the environment says.
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -457,7 +458,7 @@ def main(
     )
     args = args if args is not None else parse_args()
     config = cfg if cfg is not None else Config.from_env()
-    if filtro is None:
+    if filtro is None and cfg is None:
         filtro = FiltroProspeccao.from_env()
     if filtro is not None:
         logger.info(f"Filtro de prospecção ligado: {filtro.descrever()}")

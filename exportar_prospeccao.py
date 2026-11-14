@@ -365,11 +365,12 @@ def _valor_csv(valor: Any) -> Any:
     return "" if valor is None else valor
 
 
-def escrever_csv(linhas: list[dict], caminho: Path) -> Path:
+def escrever_csv(linhas: list[dict], caminho: Path, colunas: list[str] | None = None) -> Path:
     """CSV ; com BOM (abre direto no Excel em pt-BR)."""
+    colunas = colunas or COLUNAS_CSV
     caminho.parent.mkdir(parents=True, exist_ok=True)
     with open(caminho, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=COLUNAS_CSV, delimiter=";", extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=colunas, delimiter=";", extrasaction="ignore")
         writer.writeheader()
         for linha in linhas:
             plana = dict(linha)
@@ -377,7 +378,7 @@ def escrever_csv(linhas: list[dict], caminho: Path) -> Path:
             plana["telefone_1"] = tels[0]["numero"] if len(tels) > 0 else None
             plana["telefone_2"] = tels[1]["numero"] if len(tels) > 1 else None
             plana["cnaes_secundarios"] = ",".join(c["id"] for c in linha.get("cnaes_secundarios") or [])
-            writer.writerow({k: _valor_csv(plana.get(k)) for k in COLUNAS_CSV})
+            writer.writerow({k: _valor_csv(plana.get(k)) for k in colunas})
     return caminho
 
 
