@@ -87,7 +87,7 @@ estar rodando):
 
 ```powershell
 schtasks /Create /TN "Prospeccao Receita GestaoRevenda" /SC WEEKLY /D MON /ST 03:00 /RL LIMITED `
-  /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\GestaoPonte\beemore-pipeline\scripts\rodar_mensal.ps1"
+  /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\GestaoPonte\cnpj-pipeline\scripts\rodar_mensal.ps1"
 ```
 
 Conferir/rodar na hora: `schtasks /Query /TN "Prospeccao Receita GestaoRevenda" /V` e
@@ -98,7 +98,7 @@ perdida" nas propriedades da tarefa).
 **Linux (cron)** — `crontab -e`:
 
 ```cron
-0 3 * * 1  /caminho/beemore-pipeline/scripts/rodar_mensal.sh >> /caminho/beemore-pipeline/logs/cron.log 2>&1
+0 3 * * 1  /caminho/cnpj-pipeline/scripts/rodar_mensal.sh >> /caminho/cnpj-pipeline/logs/cron.log 2>&1
 ```
 
 ## Roteiro de teste
