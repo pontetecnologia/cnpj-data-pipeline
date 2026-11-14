@@ -7,6 +7,7 @@ Uso:
     python rodar_mensal.py --tudo          # envia também os já enviados (o GestaoRevenda deduplica)
     python rodar_mensal.py --sem-envio     # tudo menos o envio (gera o CSV em saida/)
     python rodar_mensal.py --mes 2026-10   # um mês específico
+    python rodar_mensal.py --limite 20     # envia só 20 (primeiro teste real)
     just rodar-mensal [args]
 
 Janela de início de atividade: na PRIMEIRA execução bem-sucedida (estado local vazio) usa
@@ -77,6 +78,9 @@ def executar(argv: list[str] | None = None) -> int:
     parser.add_argument("--tudo", action="store_true", help="Envia também os CNPJs já enviados antes")
     parser.add_argument("--sem-envio", action="store_true", help="Não envia ao GestaoRevenda (só gera o CSV)")
     parser.add_argument("--force", action="store_true", help="Recarrega o mês mesmo se já foi carregado")
+    parser.add_argument(
+        "--limite", type=int, help="Envia só as N primeiras (teste); as demais continuam novas para a próxima"
+    )
     args = parser.parse_args(argv)
 
     caminho_log, handlers = configurar_log(Path(os.getenv("PROSPECCAO_LOGS", "logs")))
@@ -157,6 +161,10 @@ def _executar(args: argparse.Namespace, caminho_log: Path) -> int:
             novas_filial=sum(1 for linha in linhas if linha["novidade"] == FILIAL_NOVA),
             selecionadas=len(selecionadas),
         )
+        if args.limite is not None and len(selecionadas) > args.limite:
+            logger.info(f"--limite {args.limite}: enviando {args.limite} de {len(selecionadas):,}")
+            selecionadas = selecionadas[: args.limite]
+            contagens["limite"] = args.limite
         csv_lista = escrever_csv(selecionadas, Path("saida") / f"prospeccao_{mes_base}.csv")
         contagens["csv_lista"] = str(csv_lista)
         logger.info(f"Exportação: {len(linhas):,} estabelecimentos, {novas:,} novos, {len(selecionadas):,} a enviar")

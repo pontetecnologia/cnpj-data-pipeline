@@ -229,9 +229,18 @@ def test_rodar_mensal_ponta_a_ponta(
     monkeypatch.delenv("FILTRO_CNAES", raising=False)
     monkeypatch.delenv("FILTRO_SITUACAO", raising=False)
 
+    # Teste com --limite: só 1 enviado, os outros continuam novos
+    assert rodar_mensal.executar(["--mes", "2024-01", "--limite", "1"]) == 0
+    assert sorted(gr.leads) == ["11111111000100"]
+    gr.leads.clear()
+    import sqlite3
+
+    with sqlite3.connect(tmp_path / "estado.sqlite") as conn:  # volta ao estado "nunca enviado"
+        conn.executescript("DELETE FROM execucao_itens; DELETE FROM cnpjs_enviados; DELETE FROM execucoes;")
+
     # 1ª execução: janela 0 meses → além dos 2 estabelecimentos de 11111111 (2026), entra também
     # 55555555 (ativa em Joinville, aberta em 2020). O GestaoRevenda falso bloqueia a filial 0002.
-    assert rodar_mensal.executar(["--mes", "2024-01"]) == 0
+    assert rodar_mensal.executar(["--mes", "2024-01", "--force"]) == 0
     assert "/2024-01/Socios0.zip" not in downloads
     assert sorted(gr.leads) == ["11111111000100", "11111111000211", "55555555000100"]
     assert not [p for p in (tmp_path / "temp").rglob("*") if p.is_file() and p.name != ".pipeline.lock"]
