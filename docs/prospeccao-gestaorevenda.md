@@ -118,8 +118,11 @@ Pré-requisitos: Docker rodando, `.venv` criado (`python -m venv .venv` e
 
 ### B. Backend do GestaoRevenda
 
-5. Publique o backend com as alterações (a migration `20261115000000_leads_fonte_receita_federal`
-   roda sozinha no start do container) e o frontend (rótulo "Receita Federal").
+5. Publique o backend e o frontend da branch `prospeccao-receita-federal` do GestaoRevenda
+   seguindo `docs/integracoes/normalizacao-cnpj.md` daquele repositório: relatório prévio
+   (só leitura), backup do banco, deploy (as migrations `20261115000000_leads_fonte_receita_federal`
+   e `20261115010000_normalizar_cnpj` rodam no start do container), conferência e, se preciso,
+   volta atrás.
 6. **Importação CSV antiga** (regressão): importe um CSV pela tela de Leads como sempre. Esperado:
    mesmo resultado de antes (fonte cnpj.chat, consulta CNPJ enfileirada).
 7. Em Configurações → API Externa, crie um Client com o escopo **leads**; coloque
