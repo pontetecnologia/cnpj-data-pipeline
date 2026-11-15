@@ -57,6 +57,13 @@ test-docker IMAGE:
 rodar-mensal *ARGS:
     uv run python rodar_mensal.py {{ARGS}}
 
+# Prospecção agora, com as regras do serviço (ex.: just prospeccao-agora --sem-envio)
+prospeccao-agora *ARGS:
+    uv run python servico_prospeccao.py --agora {{ARGS}}
+
+prospeccao-status:
+    uv run python servico_prospeccao.py --status
+
 # Só a exportação (CSV em saida/), sem enviar
 exportar-prospeccao *ARGS:
     uv run python exportar_prospeccao.py {{ARGS}}

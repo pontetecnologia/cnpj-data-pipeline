@@ -27,6 +27,7 @@ only-include = [
     "initial.sql",
     # Adaptação GestaoRevenda (prospecção)
     "filtro.py", "estado_prospeccao.py", "exportar_prospeccao.py", "enviar_gestaorevenda.py", "rodar_mensal.py",
+    "notificacao.py", "servico_prospeccao.py",
 ]
 
 [tool.pytest.ini_options]

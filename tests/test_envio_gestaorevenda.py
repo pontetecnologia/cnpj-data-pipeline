@@ -192,17 +192,11 @@ def test_config_exige_credenciais(monkeypatch: pytest.MonkeyPatch) -> None:
 # ── rodar_mensal ponta a ponta: Receita falsa (WebDAV) + GestaoRevenda falso ────────────
 
 
-def test_rodar_mensal_ponta_a_ponta(
-    source_server: tuple[str, Event, list[str]],
-    fake_gr: tuple[str, FakeGR],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def _ambiente_ponta_a_ponta(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, base_url: str, api: str, envio_ativo: str
 ) -> None:
-    import rodar_mensal
-
-    base_url, _fail, downloads = source_server
-    api, gr = fake_gr
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("config.load_dotenv", lambda *a, **k: False)  # não ler o .env real do projeto
     env = {
         "BASE_URL": base_url,
         "SHARE_TOKEN": "test",
@@ -223,22 +217,36 @@ def test_rodar_mensal_ponta_a_ponta(
         "GR_CLIENT_ID": "id",
         "GR_CLIENT_SECRET": "segredo",
         "GR_LOTE": "1",
+        "SERVICO_ENVIO_ATIVO": envio_ativo,
     }
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     monkeypatch.delenv("FILTRO_CNAES", raising=False)
     monkeypatch.delenv("FILTRO_SITUACAO", raising=False)
 
-    # Teste com --limite: só 1 enviado, os outros continuam novos
+
+def test_rodar_mensal_ponta_a_ponta(
+    source_server: tuple[str, Event, list[str]],
+    fake_gr: tuple[str, FakeGR],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rodar_mensal
+
+    base_url, _fail, downloads = source_server
+    api, gr = fake_gr
+    _ambiente_ponta_a_ponta(monkeypatch, tmp_path, base_url, api, envio_ativo="true")
+
+    # Teste com --limite: só 1 enviado, os outros continuam novos. PARCIAL não conta como
+    # 1ª execução: a próxima continua com a janela de 0 meses e manda o restante.
     assert rodar_mensal.executar(["--mes", "2024-01", "--limite", "1"]) == 0
     assert sorted(gr.leads) == ["11111111000100"]
-    gr.leads.clear()
-    import sqlite3
+    with EstadoProspeccao(tmp_path / "estado.sqlite") as estado:
+        ultima = estado.ultima_execucao()
+        assert ultima is not None and ultima["status"] == "PARCIAL"
+        assert not estado.mes_concluido("2024-01", aceitar_sem_envio=False)
 
-    with sqlite3.connect(tmp_path / "estado.sqlite") as conn:  # volta ao estado "nunca enviado"
-        conn.executescript("DELETE FROM execucao_itens; DELETE FROM cnpjs_enviados; DELETE FROM execucoes;")
-
-    # 1ª execução: janela 0 meses → além dos 2 estabelecimentos de 11111111 (2026), entra também
+    # Execução completa: janela 0 meses → além dos 2 estabelecimentos de 11111111 (2026), entra também
     # 55555555 (ativa em Joinville, aberta em 2020). O GestaoRevenda falso bloqueia a filial 0002.
     assert rodar_mensal.executar(["--mes", "2024-01", "--force"]) == 0
     assert "/2024-01/Socios0.zip" not in downloads
@@ -246,12 +254,13 @@ def test_rodar_mensal_ponta_a_ponta(
     assert not [p for p in (tmp_path / "temp").rglob("*") if p.is_file() and p.name != ".pipeline.lock"]
     with EstadoProspeccao(tmp_path / "estado.sqlite") as estado:
         ultima = estado.ultima_execucao()
+        assert estado.mes_concluido("2024-01", aceitar_sem_envio=False)
     assert ultima is not None and ultima["status"] == "OK"
     c = ultima["contagens"]
     assert c["janela_inicio_atividade_meses"] == 0
     assert c["linhas_lidas"]["estabelecimentos"] == 6 and c["linhas_filtradas"]["estabelecimentos"] == 3
-    assert (c["exportadas"], c["novas"]) == (3, 3)
-    assert c["envio"]["enviadas"] == 3 and c["envio"]["importados"] == 3 and c["envio"]["bloqueados"] == 1
+    assert (c["exportadas"], c["novas"]) == (3, 2)  # 11111111000100 já foi no teste com --limite
+    assert c["envio"]["enviadas"] == 2 and c["envio"]["importados"] == 2 and c["envio"]["bloqueados"] == 1
     assert list((tmp_path / "logs").glob("rodar_mensal_*.log"))
     assert (tmp_path / "saida" / "prospeccao_2024-01.csv").exists()
 
@@ -264,6 +273,55 @@ def test_rodar_mensal_ponta_a_ponta(
     assert ultima is not None
     assert ultima["contagens"]["janela_inicio_atividade_meses"] == 12
     assert ultima["contagens"]["selecionadas"] == 0 and ultima["contagens"]["envio"] == {"enviadas": 0}
+
+
+def test_rodar_mensal_envio_desligado(
+    source_server: tuple[str, Event, list[str]],
+    fake_gr: tuple[str, FakeGR],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SERVICO_ENVIO_ATIVO=false: roda tudo como --sem-envio, nada chega ao GestaoRevenda."""
+    import rodar_mensal
+
+    base_url, _fail, _downloads = source_server
+    api, gr = fake_gr
+    _ambiente_ponta_a_ponta(monkeypatch, tmp_path, base_url, api, envio_ativo="false")
+
+    assert rodar_mensal.executar(["--mes", "2024-01"]) == 0
+    assert gr.payloads == [] and gr.tokens_emitidos == 0
+    with EstadoProspeccao(tmp_path / "estado.sqlite") as estado:
+        ultima = estado.ultima_execucao()
+        # Enquanto o envio está desligado o mês conta como processado; ao ligar, volta a ficar pendente
+        assert estado.mes_concluido("2024-01", aceitar_sem_envio=True)
+        assert not estado.mes_concluido("2024-01", aceitar_sem_envio=False)
+    assert ultima is not None and ultima["status"] == "SEM_ENVIO"
+    assert "SERVICO_ENVIO_ATIVO" in ultima["contagens"]["envio_desligado"]
+    assert ultima["contagens"]["selecionadas"] == 3 and ultima["contagens"]["envio"] is None
+
+    # GR_* vazio também desliga, mesmo com SERVICO_ENVIO_ATIVO=true
+    monkeypatch.setenv("SERVICO_ENVIO_ATIVO", "true")
+    monkeypatch.setenv("GR_CLIENT_SECRET", "")
+    assert rodar_mensal.executar(["--mes", "2024-01"]) == 0
+    assert gr.payloads == []
+    with EstadoProspeccao(tmp_path / "estado.sqlite") as estado:
+        ultima = estado.ultima_execucao()
+    assert ultima is not None and "GR_CLIENT_SECRET" in ultima["contagens"]["envio_desligado"]
+
+
+def test_rodar_mensal_uma_execucao_por_vez(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Com a trava da prospecção em uso, sai com código 2 sem registrar execução."""
+    import rodar_mensal
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("config.load_dotenv", lambda *a, **k: False)
+    monkeypatch.setenv("PROSPECCAO_FILTRO", "true")
+    monkeypatch.setenv("PROSPECCAO_ESTADO", str(tmp_path / "estado" / "prospeccao.sqlite"))
+    monkeypatch.setenv("PROSPECCAO_LOGS", str(tmp_path / "logs"))
+    with rodar_mensal.trava_prospeccao(rodar_mensal.caminho_trava()) as obtida:
+        assert obtida
+        assert rodar_mensal.executar(["--sem-envio"]) == rodar_mensal.CODIGO_OCUPADO
+    assert not (tmp_path / "estado" / "prospeccao.sqlite").exists()
 
 
 def test_rodar_mensal_exige_filtro(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

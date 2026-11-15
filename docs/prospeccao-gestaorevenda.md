@@ -5,6 +5,10 @@ e enviá-las como leads ao GestaoRevenda.
 
 ## Como funciona
 
+O serviço Windows **"Ponte - Prospecção Receita"** (`servico_prospeccao.py`, rodando pelo WinSW) verifica
+todo dia às 03:00 se a Receita publicou mês novo. Se o mês mais recente ainda não foi processado, roda o
+`rodar_mensal.py` para ele e manda um e-mail com as contagens; se já foi, não faz nada.
+
 ```
 rodar_mensal.py
  ├─ 1. baixa o mês mais recente da Receita (sem os arquivos de sócios)
@@ -24,13 +28,18 @@ rodar_mensal.py
 | `estado/prospeccao.sqlite` | O que já foi enviado, por execução — **não apague** (sem ele tudo volta a ser "novo"; o GestaoRevenda deduplica, mas reenvia tudo) |
 | `saida/prospeccao_AAAA-MM.csv` | Lista do mês (o que seria/foi enviado) |
 | `saida/enviados_AAAA-MM_*.csv` | Backup de cada envio, com o resultado de cada linha |
-| `logs/rodar_mensal_*.log` | Log de cada execução; a última linha "Resumo" traz as contagens |
+| `logs/rodar_mensal_*.log` | Log de cada execução; a última linha "Resumo" traz as contagens. Apagados após `SERVICO_LOGS_MANTER_DIAS` |
+| `logs/servico.log` | Log do serviço (verificações diárias), rotação 10 MB × 10. `servico_manual.log` = `rodar_agora` |
+| `logs/winsw/` | Log do WinSW (o "embrulho" do serviço) |
+| `parquet/AAAA-MM/` | Dados filtrados do mês (substitui o Postgres; uma pasta por mês) |
+| `servico/` | WinSW e o XML do serviço, gerados pelo instalador (fora do git) |
 
 ## Configuração (`.env`)
 
 | Variável | Valor atual | Observação |
 |---|---|---|
 | `PROSPECCAO_FILTRO` | `true` | `false` = pipeline original (carga completa) |
+| `OUTPUT_FORMAT` | `parquet` | O serviço roda sem login, sem o Postgres do Docker Desktop. Obrigatório para o instalador |
 | `FILTRO_SITUACAO` | `02` | ativa |
 | `FILTRO_CNAES` | 4711-3/02, 4712-1/00, 4711-3/01, 4744-0/99, 4744-0/01, 4530-7/03, 4789-0/04 | aceita com ou sem máscara |
 | `FILTRO_UF` | `SC` | |
@@ -41,6 +50,14 @@ rodar_mensal.py
 | `GR_CLIENT_ID` / `GR_CLIENT_SECRET` | *(preencher)* | GestaoRevenda → Configurações → API Externa, escopo **leads** |
 | `GR_LOTE` | `200` | linhas por requisição (máx. 1000) |
 | `GR_ENFILEIRAR_CNPJA` | `false` | `true` faz o GestaoRevenda consultar cada CNPJ na cnpja.com (4/min) |
+| `SERVICO_ENVIO_ATIVO` | `false` | **Só envia com `true`** (depois do deploy do backend). `false` ou `GR_*` vazios: roda tudo como `--sem-envio` e o e-mail avisa "envio desligado". Vale também para o `rodar_mensal.py` direto |
+| `SERVICO_HORARIO` | `03:00` | Verificação diária. Desligado nesse horário: roda `SERVICO_ATRASO_INICIAL_MIN` (10) depois de ligar |
+| `SERVICO_DISCO_MIN_GB` | `25` | Sem esse espaço livre (descontado o que já está em `temp/`): pula, registra e avisa |
+| `SERVICO_TENTATIVAS_DIA` / `SERVICO_INTERVALO_TENTATIVA_MIN` | `3` / `60` | Receita fora do ar ou outra execução rodando |
+| `SMTP_HOST`, `SMTP_PORTA`, `SMTP_SEGURANCA`, `SMTP_USUARIO`, `SMTP_SENHA`, `EMAIL_DE`, `EMAIL_PARA` | *(preencher)* | Aviso por e-mail. Vazio = só log. Ver "E-mail" abaixo |
+
+O serviço relê o `.env` a cada ciclo: mudar `SERVICO_ENVIO_ATIVO`, o horário ou o e-mail não exige
+reiniciar o serviço.
 
 ## O que chega no GestaoRevenda
 
@@ -76,78 +93,139 @@ O volume da 1ª execução (janela 0 meses) foi 7.174 estabelecimentos; com a ja
 986 deles se qualificariam — é a ordem de grandeza esperada por mês daqui pra frente (só os novos
 são enviados).
 
-## Agendamento
+## Serviço Windows
 
-A Receita publica uma vez por mês, sem data fixa. Rodar **toda segunda às 3h** é barato: se não
-houver mês novo, o pipeline só lista o servidor, vê que o mês já foi carregado e não envia nada
-novo.
+| | |
+|---|---|
+| Nome | **Ponte - Prospecção Receita** (`PonteProspeccaoReceita`) |
+| Wrapper | [WinSW](https://github.com/winsw/winsw) 2.12.0, baixado pelo instalador com SHA-256 fixo |
+| Conta | Virtual `NT SERVICE\PonteProspeccaoReceita`: sem senha, sem administrador. Lê a pasta do projeto e escreve só em `logs`, `estado`, `saida`, `temp` e `parquet` |
+| Início | Automático (atrasado), sem login e sem janela. Reinicia se cair (1, 5 e 15 min) |
+| Python | O do `.venv`, criado a partir do Python **para todos os usuários** em `C:\Program Files` |
 
-**Windows (Agendador de Tarefas)** — em um PowerShell como o seu usuário (Docker Desktop precisa
-estar rodando):
+**O que ele faz todo dia:**
+
+1. A partir das 03:00, ou 10 min depois de ligar se o computador estava desligado, lista os meses da Receita.
+2. Se já existe execução `OK` para o mês mais recente, não faz nada. Enquanto o envio estiver desligado, `SEM_ENVIO` também conta. Ao ligar o envio, o mês volta a ficar pendente e é enviado na verificação seguinte.
+3. Se o mês está pendente, confere o disco e roda o `rodar_mensal.py --mes <mês>` num subprocesso.
+4. Manda o e-mail: contagens (lidas, filtradas, novas, enviadas, importadas, duplicadas, bloqueadas, recusadas) ou o erro com o fim do log.
+
+Os dias sem mês novo não geram e-mail.
+
+**Uma execução por vez:** a trava `estado/.prospeccao.lock` cobre carga, exportação e envio. O serviço e
+o `rodar_agora` usam a mesma trava; quem chega depois sai sem fazer nada.
+
+**Desligado no meio:** a próxima execução retoma de onde parou.
+
+| Onde parou | O que acontece |
+|---|---|
+| Download | Retoma o `.part` |
+| Carga | Pula as tabelas Parquet já gravadas (a gravação é atômica) |
+| Exportação | Refeita (~1 s) |
+| Envio | Os lotes aceitos já estão no estado e não são reenviados. O lote que estava no ar, se for de novo, volta `DUPLICADO` do GestaoRevenda |
+
+A execução que ficou pela metade aparece como `INTERROMPIDA`. Os temporários só são apagados quando a execução termina bem.
+
+**`--limite`** gera status `PARCIAL`. Esse status não conta como mês concluído nem como "primeira execução", então a janela continua em 0 meses e o restante vai na execução seguinte.
+
+### Instalar
+
+1. Python **para todos os usuários** (o instalador exige e recria o `.venv` a partir dele):
+   `winget install --id Python.Python.3.12 --scope machine`. Ou use o instalador de python.org: "Customize installation" → "Install Python for all users".
+2. Feche o VS Code e os terminais que usam o `.venv`, porque ele é recriado.
+3. PowerShell **como Administrador**, na pasta do projeto:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts\instalar_servico.ps1
+   ```
+   Pode rodar de novo para atualizar (depois de um `git pull`, por exemplo).
+4. Remover: `scripts\desinstalar_servico.ps1` (como Administrador). Mantém `estado\`, `logs\`, `saida\`, `parquet\` e o `.env`.
+
+O instalador deixa o `.env` legível só por SYSTEM, Administradores, o seu usuário e o serviço.
+
+### Rodar na hora e acompanhar
+
+Não precisa de administrador:
 
 ```powershell
-schtasks /Create /TN "Prospeccao Receita GestaoRevenda" /SC WEEKLY /D MON /ST 03:00 /RL LIMITED `
-  /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\GestaoPonte\cnpj-pipeline\scripts\rodar_mensal.ps1"
+scripts\rodar_agora.ps1                 # igual à verificação diária (respeita SERVICO_ENVIO_ATIVO)
+scripts\rodar_agora.ps1 -SemEnvio       # gera a lista sem enviar
+scripts\rodar_agora.ps1 -Limite 20      # envia só 20
+scripts\rodar_agora.ps1 -Forcar         # roda mesmo se o mês já foi processado
+scripts\rodar_agora.ps1 -Recarregar     # baixa e carrega o mês do zero
+scripts\rodar_agora.ps1 -Status         # serviço, últimas verificações e execuções, próxima verificação
+scripts\rodar_agora.ps1 -TestarEmail
 ```
 
-Conferir/rodar na hora: `schtasks /Query /TN "Prospeccao Receita GestaoRevenda" /V` e
-`schtasks /Run /TN "Prospeccao Receita GestaoRevenda"`. O computador precisa estar ligado no
-horário (ou marque "Executar o mais cedo possível após uma inicialização agendada ter sido
-perdida" nas propriedades da tarefa).
+### E-mail
 
-**Linux (cron)** — `crontab -e`:
+| Provedor | `SMTP_HOST` | Porta / segurança | Senha |
+|---|---|---|---|
+| Gmail | `smtp.gmail.com` | 587 / `starttls` | Senha de app (exige verificação em 2 etapas) |
+| Microsoft 365 | `smtp.office365.com` | 587 / `starttls` | Exige "SMTP autenticado" liberado na caixa. A Microsoft vem desligando a autenticação básica no SMTP do Exchange Online; se o login falhar com 535, use outra conta/relay |
 
-```cron
-0 3 * * 1  /caminho/cnpj-pipeline/scripts/rodar_mensal.sh >> /caminho/cnpj-pipeline/logs/cron.log 2>&1
-```
+`EMAIL_PARA` aceita vários destinatários separados por vírgula. Uma falha de e-mail vai para o log e
+nunca derruba a execução.
 
 ## Roteiro de teste
 
-Pré-requisitos: Docker rodando, `.venv` criado (`python -m venv .venv` e
-`.venv\Scripts\python -m pip install -e .`), `.env` configurado.
+Pré-requisitos: Python para todos os usuários instalado, `.env` com `OUTPUT_FORMAT=parquet`,
+`SERVICO_ENVIO_ATIVO=false` e o e-mail preenchido.
 
-### A. Pipeline sem envio (seguro — não toca no GestaoRevenda)
+### A. Sem tocar no GestaoRevenda
 
-1. `docker compose up -d postgres`
-2. `.venv\Scripts\python rodar_mensal.py --sem-envio`
-   - Esperado: termina com `Resumo (SEM_ENVIO)`, `exportadas` ≈ 7.174 (base 2026-10), CSV em
-     `saida\prospeccao_2026-10.csv`.
-3. Abra o CSV no Excel e confira 5 a 10 CNPJs no cartão CNPJ da Receita: razão social, endereço,
-   telefone, CNAE, situação.
-4. Confira que `temp\` está vazia ao final.
+1. `scripts\instalar_servico.ps1 -SemIniciar` (como Administrador). Ele recria o `.venv` e instala o
+   serviço parado. Confira a saída: conta `NT SERVICE\PonteProspeccaoReceita`, início automático (atraso).
+2. `scripts\rodar_agora.ps1 -TestarEmail`. Esperado: chega o e-mail de teste.
+3. `scripts\rodar_agora.ps1 -Forcar` (o mês 2026-10 já tem uma execução sem envio, por isso o `-Forcar`).
+   - Esperado: baixa ~6,6 GB e carrega em Parquet (~30 min), com `Resumo (SEM_ENVIO)` e `exportadas` ≈ 7.174.
+   - Chega o e-mail "OK (envio desligado)" com as contagens.
+   - `parquet\2026-10\` foi criado e `temp\` termina vazia.
+4. Retomada: rode `scripts\rodar_agora.ps1 -Recarregar` e aperte Ctrl+C durante o download. Rode de novo
+   `scripts\rodar_agora.ps1 -Forcar`.
+   - Esperado: o log diz que a anterior foi marcada `INTERROMPIDA` e o download retoma de onde parou, sem recomeçar do zero.
+5. Uma por vez: com o passo 4 ainda rodando, abra outro terminal e rode `scripts\rodar_agora.ps1 -Forcar`.
+   - Esperado: "Já há uma execução da prospecção em andamento", e o resultado é `OCUPADO`.
+6. Disco: no `.env`, `SERVICO_DISCO_MIN_GB=9999`, e rode `scripts\rodar_agora.ps1 -Forcar`.
+   - Esperado: `DISCO_INSUFICIENTE` e o e-mail "PULADA". Volte para 25.
 
-### B. Backend do GestaoRevenda
+### B. Serviço
 
-5. Publique o backend e o frontend da branch `prospeccao-receita-federal` do GestaoRevenda
-   seguindo `docs/integracoes/normalizacao-cnpj.md` daquele repositório: relatório prévio
-   (só leitura), backup do banco, deploy (as migrations `20261115000000_leads_fonte_receita_federal`
-   e `20261115010000_normalizar_cnpj` rodam no start do container), conferência e, se preciso,
-   volta atrás.
-6. **Importação CSV antiga** (regressão): importe um CSV pela tela de Leads como sempre. Esperado:
-   mesmo resultado de antes (fonte cnpj.chat, consulta CNPJ enfileirada).
-7. Em Configurações → API Externa, crie um Client com o escopo **leads**; coloque
-   `GR_API_URL`, `GR_CLIENT_ID` e `GR_CLIENT_SECRET` no `.env`.
+7. Para ver a verificação sem esperar até as 03:00, coloque no `.env` `SERVICO_HORARIO` alguns minutos
+   antes de agora e `SERVICO_ATRASO_INICIAL_MIN=1`. Inicie o serviço: `Start-Service PonteProspeccaoReceita`.
+   - Esperado em `logs\servico.log`: "iniciado" e, depois de ~1 min, "2026-10 — já processado, nada a fazer" (ou a execução, se a Receita publicou 2026-11).
+   - `scripts\rodar_agora.ps1 -Status` mostra a verificação e a próxima para amanhã.
+8. Reinicie o Windows **sem fazer login**. Espere ~15 min e entre.
+   - Esperado: `services.msc` mostra o serviço "Em execução" e `servico.log` registra o início antes do login.
+9. Com uma execução rodando pelo serviço (use `-Recarregar` no passo 7, ou espere um mês novo), pare o
+   serviço: `Stop-Service PonteProspeccaoReceita`. Inicie de novo.
+   - Esperado: a anterior fica `INTERROMPIDA` e a nova retoma.
+10. Volte `SERVICO_HORARIO=03:00` e `SERVICO_ATRASO_INICIAL_MIN=10`.
 
-### C. Primeiro envio real, pequeno
+### C. Backend do GestaoRevenda e envio real
 
-8. `.venv\Scripts\python rodar_mensal.py --limite 20`
-   - Esperado no log: `Lote 1: 20 enviadas — N importadas (B bloqueadas), D duplicadas, 0 erros`
-     e `Resumo (OK)`.
-9. No GestaoRevenda, filtre Leads pela fonte "Receita Federal" e confira em 3 leads: segmento pelo
-   CNAE, porte/Simples/MEI/matriz-filial preenchidos, observações vazias, score calculado, status
-   NOVO, sem "Na fila" de consulta CNPJ.
-10. Rode de novo `rodar_mensal.py --limite 20`: deve enviar **outros** 20 (os primeiros já são
-    `JA_ENVIADO`).
-11. Abra `saida\enviados_2026-10_*.csv`: a coluna `resultado` bate com o log.
+11. Publique o backend e o frontend da branch `prospeccao-receita-federal` do GestaoRevenda seguindo
+    `docs/integracoes/normalizacao-cnpj.md` daquele repositório: relatório prévio (só leitura), backup do
+    banco, deploy (as migrations `20261115000000_leads_fonte_receita_federal` e
+    `20261115010000_normalizar_cnpj` rodam no start do container), conferência e, se preciso, volta atrás.
+12. **Importação CSV antiga** (regressão): importe um CSV pela tela de Leads como sempre. Esperado: mesmo
+    resultado de antes (fonte cnpj.chat, consulta CNPJ enfileirada).
+13. Em Configurações → API Externa, crie um Client com o escopo **leads**. Preencha `GR_API_URL`,
+    `GR_CLIENT_ID` e `GR_CLIENT_SECRET` e mude `SERVICO_ENVIO_ATIVO=true` no `.env`.
+14. `scripts\rodar_agora.ps1 -Limite 20`.
+    - Esperado: `Lote 1: 20 enviadas — N importadas …`, status `PARCIAL` e o e-mail "OK PARCIAL".
+    - No GestaoRevenda, filtre Leads pela fonte "Receita Federal" e confira 3 leads: segmento pelo CNAE,
+      porte/Simples/MEI/matriz-filial, score, status NOVO, sem "Na fila" de consulta CNPJ.
+15. Desligar no meio do envio: rode `scripts\rodar_agora.ps1` (envia o restante, ~7.154 em ~36 lotes) e
+    feche o terminal (ou desligue o computador) depois de alguns lotes. Rode de novo `scripts\rodar_agora.ps1`.
+    - Esperado: a primeira vira `INTERROMPIDA` e a segunda envia só o que faltou.
+    - No fim, `Status: OK`, a janela ainda em 0 meses e, no GestaoRevenda, nenhum CNPJ em dobro.
+    - Nos `saida\enviados_2026-10_*.csv`, a soma das linhas bate com o total.
+16. Na verificação seguinte do serviço (ou `scripts\rodar_agora.ps1`): `SEM_NOVIDADE`, sem e-mail.
 
-### D. Envio completo
+### D. Remoção
 
-12. `.venv\Scripts\python rodar_mensal.py` — envia o restante (~7.134). Acompanhe pelo log.
-13. Rode de novo sem nada novo: `selecionadas: 0`, `envio: {"enviadas": 0}`.
-
-### E. Agendamento
-
-14. Crie a tarefa (seção Agendamento), rode com `schtasks /Run` e confira o log novo em `logs\`.
+17. `scripts\desinstalar_servico.ps1` (como Administrador). Esperado: o serviço some do `services.msc`, e
+    `estado\`, `logs\`, `saida\` e `parquet\` continuam no lugar. Reinstalar continua de onde parou.
 
 ## Problemas comuns
 
@@ -159,3 +237,10 @@ Pré-requisitos: Docker rodando, `.venv` criado (`python -m venv .venv` e
 | `Município não encontrado na tabela da Receita` | Nome grafado diferente da Receita; use o código (ver log da carga) |
 | `Another run is using TEMP_DIR` | Já há uma execução rodando |
 | Falha no meio do envio | Rode de novo: o que foi aceito está no estado e não é reenviado como novo |
+| `Já há uma execução da prospecção em andamento` | O serviço ou outro `rodar_agora` está rodando: `rodar_agora.ps1 -Status` |
+| E-mail diz "envio desligado" | `SERVICO_ENVIO_ATIVO=false` ou `GR_*` vazio no `.env` (intencional até o deploy do backend) |
+| E-mail "PULADA — espaço em disco" | Libere espaço no disco do projeto (25 GB); a verificação do dia seguinte tenta de novo |
+| `E-mail não enviado … 535` no log | Usuário/senha SMTP recusados: Gmail = senha de app; 365 = SMTP AUTH liberado |
+| Instalador: "Nenhum Python >= 3.11 instalado para todos os usuários" | `winget install --id Python.Python.3.12 --scope machine` |
+| Instalador: "Não consegui apagar o .venv" | Feche o VS Code e os terminais que usam o `.venv` e rode de novo |
+| Serviço não inicia | `logs\winsw\*.log` e `logs\rodar_mensal_saida.txt`; `scripts\rodar_agora.ps1 -Status` |

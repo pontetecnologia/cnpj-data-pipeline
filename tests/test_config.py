@@ -10,6 +10,15 @@ from config import Config
 class TestFromEnv:
     """Test Config.from_env() environment variable parsing."""
 
+    @pytest.fixture(autouse=True)
+    def _sem_dotenv_real(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Ambiente isolado: from_env() chama load_dotenv(), que leria o .env da máquina."""
+
+        def _nao_carregar(*_args: object, **_kwargs: object) -> bool:
+            return False
+
+        monkeypatch.setattr("config.load_dotenv", _nao_carregar)
+
     def test_defaults_when_no_env_vars(self) -> None:
         """All fields should have sensible defaults when env vars are absent."""
         with patch.dict("os.environ", {}, clear=True):

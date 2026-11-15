@@ -12,3 +12,5 @@ coverage.xml
 estado/
 saida/
 logs/
+# Serviço Windows: WinSW baixado e XML gerado pelo instalador
+servico/

@@ -10,11 +10,23 @@ Uso:
     python rodar_mensal.py --limite 20     # envia só 20 (primeiro teste real)
     just rodar-mensal [args]
 
-Janela de início de atividade: na PRIMEIRA execução bem-sucedida (estado local vazio) usa
-FILTRO_PRIMEIRA_EXECUCAO_MESES (padrão 0 = todas as ativas da região); nas seguintes,
-FILTRO_INICIO_ATIVIDADE_MESES (padrão 12).
+Envio: só acontece com SERVICO_ENVIO_ATIVO=true e GR_* preenchidos no .env; senão a execução roda
+como --sem-envio e registra o motivo (ver enviar_gestaorevenda.motivo_envio_desligado).
 
-Log: logs/rodar_mensal_AAAA-MM-DD_HHMMSS.log. Código de saída 0 = OK, 1 = falha (para o agendador).
+Janela de início de atividade: até a PRIMEIRA execução com envio completo (status OK) usa
+FILTRO_PRIMEIRA_EXECUCAO_MESES (padrão 0 = todas as ativas da região); depois,
+FILTRO_INICIO_ATIVIDADE_MESES (padrão 12). Execuções com --limite (PARCIAL) e --sem-envio não contam.
+
+Uma execução por vez: a trava estado/.prospeccao.lock cobre carga, exportação e envio. Quem
+chega com outra em andamento sai com código 2 sem tocar em nada.
+
+Retomada: se o processo morrer no meio, a próxima execução marca a anterior como INTERROMPIDA,
+retoma downloads (.part) e tabelas Parquet já gravadas, e não reenvia o que o GestaoRevenda já
+aceitou. Os temporários (temp/) só são apagados quando a execução termina bem.
+
+Log: logs/rodar_mensal_AAAA-MM-DD_HHMMSS.log.
+Código de saída: 0 = OK / PARCIAL / SEM_ENVIO, 1 = falha, 2 = outra execução em andamento,
+130 = interrompida (Ctrl+C, parada do serviço).
 """
 
 from __future__ import annotations
@@ -24,8 +36,11 @@ import json
 import logging
 import os
 import shutil
+import signal
 import sys
 import time
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -34,6 +49,12 @@ from estado_prospeccao import CNPJ_INEDITO, FILIAL_NOVA, EstadoProspeccao
 from filtro import ContadoresFiltro, FiltroProspeccao
 
 logger = logging.getLogger("rodar_mensal")
+
+CODIGO_OK = 0
+CODIGO_FALHA = 1
+CODIGO_OCUPADO = 2
+CODIGO_INTERROMPIDA = 130
+STATUS_CONCLUIDOS = ("OK", "PARCIAL", "SEM_ENVIO")
 
 
 def configurar_log(pasta: Path) -> tuple[Path, list[logging.Handler]]:
@@ -47,6 +68,22 @@ def configurar_log(pasta: Path) -> tuple[Path, list[logging.Handler]]:
         handler.setFormatter(fmt)
         raiz.addHandler(handler)
     return caminho, handlers
+
+
+def caminho_trava() -> Path:
+    """Arquivo de trava da prospecção, ao lado do estado local."""
+    return Path(os.getenv("PROSPECCAO_ESTADO", "estado/prospeccao.sqlite")).parent / ".prospeccao.lock"
+
+
+@contextmanager
+def trava_prospeccao(caminho: Path) -> Generator[bool]:
+    """True se obteve a trava. O sistema operacional solta a trava quando o processo termina,
+    inclusive se for morto ou o computador desligar."""
+    from main import _try_lock  # pyright: ignore[reportPrivateUsage] - mesma trava do pipeline
+
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    with open(caminho, "a") as arquivo:
+        yield _try_lock(arquivo)
 
 
 def limpar_temporarios(temp_dir: str) -> int:
@@ -83,6 +120,11 @@ def executar(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if hasattr(signal, "SIGBREAK"):
+        # Ctrl+Break (o serviço pede a parada assim) vira KeyboardInterrupt: a execução fecha o
+        # estado como INTERROMPIDA em vez de o processo sumir sem registrar nada.
+        signal.signal(signal.SIGBREAK, signal.default_int_handler)
+
     caminho_log, handlers = configurar_log(Path(os.getenv("PROSPECCAO_LOGS", "logs")))
     try:
         return _executar(args, caminho_log)
@@ -93,17 +135,38 @@ def executar(argv: list[str] | None = None) -> int:
 
 
 def _executar(args: argparse.Namespace, caminho_log: Path) -> int:
-    inicio = time.monotonic()
     if not sys.stderr.isatty():
-        os.environ.setdefault("TQDM_DISABLE", "1")  # agendador: sem barra de progresso no log
+        os.environ.setdefault("TQDM_DISABLE", "1")  # agendador/serviço: sem barra de progresso no log
 
     config = Config.from_env()  # carrega o .env
     if FiltroProspeccao.from_env() is None:
         logger.error("PROSPECCAO_FILTRO precisa estar ligado (true) no .env para a execução mensal")
-        return 1
+        return CODIGO_FALHA
 
-    contagens: dict = {"mes_base": None, "modo": "tudo" if args.tudo else "novos"}
+    with trava_prospeccao(caminho_trava()) as obtida:
+        if not obtida:
+            logger.error("Já há uma execução da prospecção em andamento (serviço ou manual) — nada foi feito")
+            return CODIGO_OCUPADO
+        return _executar_travado(args, caminho_log, config)
+
+
+def _executar_travado(args: argparse.Namespace, caminho_log: Path, config: Config) -> int:
+    from enviar_gestaorevenda import motivo_envio_desligado
+
+    inicio = time.monotonic()
+    contagens: dict = {"mes_base": None, "modo": "tudo" if args.tudo else "novos", "log": str(caminho_log)}
+    desligado = None if args.sem_envio else motivo_envio_desligado()
+    sem_envio = args.sem_envio or desligado is not None
+    if desligado:
+        logger.warning(f"{desligado} — rodando como --sem-envio")
+        contagens["envio_desligado"] = desligado
+    elif args.sem_envio:
+        contagens["envio_desligado"] = "--sem-envio"
+
     estado = EstadoProspeccao()
+    orfas = estado.marcar_interrompidas()
+    if orfas:
+        logger.warning(f"{orfas} execução(ões) anterior(es) não terminaram (desligamento?) — marcadas INTERROMPIDA")
     execucao_id: int | None = None
     status = "FALHOU"
     try:
@@ -161,18 +224,20 @@ def _executar(args: argparse.Namespace, caminho_log: Path) -> int:
             novas_filial=sum(1 for linha in linhas if linha["novidade"] == FILIAL_NOVA),
             selecionadas=len(selecionadas),
         )
+        cortada = False
         if args.limite is not None and len(selecionadas) > args.limite:
             logger.info(f"--limite {args.limite}: enviando {args.limite} de {len(selecionadas):,}")
             selecionadas = selecionadas[: args.limite]
             contagens["limite"] = args.limite
+            cortada = True
         csv_lista = escrever_csv(selecionadas, Path("saida") / f"prospeccao_{mes_base}.csv")
         contagens["csv_lista"] = str(csv_lista)
         logger.info(f"Exportação: {len(linhas):,} estabelecimentos, {novas:,} novos, {len(selecionadas):,} a enviar")
 
         # 4. Envia
         execucao_id = estado.iniciar_execucao(mes_base, "tudo" if args.tudo else "novos")
-        if args.sem_envio:
-            logger.info("--sem-envio: nada foi enviado ao GestaoRevenda")
+        if sem_envio:
+            logger.info(f"Nada foi enviado ao GestaoRevenda ({contagens['envio_desligado']})")
             contagens["envio"] = None
         elif not selecionadas:
             logger.info("Nada novo para enviar")
@@ -182,15 +247,25 @@ def _executar(args: argparse.Namespace, caminho_log: Path) -> int:
 
             resultado = enviar(selecionadas, mes_base, estado, execucao_id, ConfigEnvio.from_env())
             contagens["envio"] = resultado.como_dict()
-        status = "OK" if not args.sem_envio else "SEM_ENVIO"
-        return 0
+        # PARCIAL não conta como "mês concluído" nem como 1ª execução: o resto vai na próxima
+        status = "SEM_ENVIO" if sem_envio else ("PARCIAL" if cortada else "OK")
+        return CODIGO_OK
+    except KeyboardInterrupt:
+        logger.warning("Execução interrompida — a próxima retoma de onde parou")
+        contagens["erro"] = "interrompida"
+        status = "INTERROMPIDA"
+        return CODIGO_INTERROMPIDA
     except Exception as e:
         logger.exception(f"Execução mensal falhou: {e}")
         contagens["erro"] = str(e)
-        return 1
+        return CODIGO_FALHA
     finally:
-        # 5. Limpa temporários (ZIPs/CSVs) e registra
-        contagens["temporarios_apagados"] = limpar_temporarios(config.temp_dir)
+        # 5. Limpa temporários só se terminou bem: numa falha, os downloads parciais ficam para retomar
+        if status in STATUS_CONCLUIDOS:
+            contagens["temporarios_apagados"] = limpar_temporarios(config.temp_dir)
+        else:
+            contagens["temporarios_apagados"] = 0
+            logger.info(f"Temporários mantidos em {config.temp_dir} para a próxima execução retomar")
         contagens["duracao_min"] = round((time.monotonic() - inicio) / 60, 1)
         if execucao_id is None:
             execucao_id = estado.iniciar_execucao(contagens.get("mes_base"), contagens["modo"])

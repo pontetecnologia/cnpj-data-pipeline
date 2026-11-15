@@ -1,6 +1,7 @@
 """Tests for downloader module."""
 
 import logging
+import sys
 import threading
 import time
 import zipfile
@@ -1701,6 +1702,24 @@ def test_rejects_archive_paths_that_change_during_extraction(config: Config, tmp
         Downloader(config).download_file("2024-03", "Cnaes.zip")
 
 
+# No Windows, criar symlink exige "Criar links simbólicos" (administrador ou Modo de Desenvolvedor).
+_WINERROR_SEM_PRIVILEGIO_SYMLINK = 1314
+# Abrir uma pasta para escrita: IsADirectoryError no Linux/macOS, PermissionError no Windows.
+_ERRO_ESCREVER_EM_PASTA = PermissionError if sys.platform == "win32" else IsADirectoryError
+
+
+def _symlink_ou_pular(link: Path, alvo: Path, *, pasta: bool) -> None:
+    try:
+        link.symlink_to(alvo, target_is_directory=pasta)
+    except OSError as exc:
+        if sys.platform == "win32" and getattr(exc, "winerror", None) == _WINERROR_SEM_PRIVILEGIO_SYMLINK:
+            pytest.skip(
+                "Windows sem o privilégio de criar links simbólicos (WinError 1314): "
+                "rode como administrador ou ative o Modo de Desenvolvedor"
+            )
+        raise
+
+
 def test_extraction_does_not_follow_symlink_outside_temp(config: Config, tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -1708,7 +1727,7 @@ def test_extraction_does_not_follow_symlink_outside_temp(config: Config, tmp_pat
     sentinel.write_text("keep me")
     workspace = tmp_path / "downloads"
     workspace.mkdir()
-    (workspace / "linked").symlink_to(outside, target_is_directory=True)
+    _symlink_ou_pular(workspace / "linked", outside, pasta=True)
     archive = workspace / "2024-03.Cnaes.zip"
     with zipfile.ZipFile(archive, "w") as z:
         z.writestr("linked/CNAECSV", "overwrite")
@@ -1741,7 +1760,7 @@ def test_extraction_rejects_internal_symlink_alias(config: Config, tmp_path: Pat
     sentinel = original / "CNAECSV"
     sentinel.write_text("keep me")
     alias = tmp_path / ("linked" if directory_link else "CNAECSV")
-    alias.symlink_to(original if directory_link else sentinel, target_is_directory=directory_link)
+    _symlink_ou_pular(alias, original if directory_link else sentinel, pasta=directory_link)
     member = "linked/CNAECSV" if directory_link else "CNAECSV"
     archive = tmp_path / "2024-03.Cnaes.zip"
     with zipfile.ZipFile(archive, "w") as z:
@@ -1767,7 +1786,7 @@ def test_cleanup_preserves_directory_after_extraction_failure(config: Config, tm
         z.writestr("CNAECSV", "01;One\n")
     config.keep_files = True
     downloader = Downloader(config)
-    with pytest.raises(IsADirectoryError):
+    with pytest.raises(_ERRO_ESCREVER_EM_PASTA):
         downloader.download_file("2024-03", "Cnaes.zip")
     config.keep_files = False
     downloader.cleanup()

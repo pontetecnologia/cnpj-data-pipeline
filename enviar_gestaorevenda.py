@@ -42,6 +42,21 @@ class EnvioError(RuntimeError):
     """Falha que não adianta repetir (credencial, payload recusado, backend sem suporte)."""
 
 
+def motivo_envio_desligado() -> str | None:
+    """None se o envio ao GestaoRevenda está liberado; senão o motivo (vai para o log e o e-mail).
+
+    Envio só com SERVICO_ENVIO_ATIVO=true (padrão false: liga-se depois do deploy do backend)
+    E com GR_API_URL / GR_CLIENT_ID / GR_CLIENT_SECRET preenchidos. Vale para o serviço, para o
+    rodar_agora e para o rodar_mensal chamado direto.
+    """
+    if os.getenv("SERVICO_ENVIO_ATIVO", "false").strip().lower() != "true":
+        return "envio desligado (SERVICO_ENVIO_ATIVO=false no .env)"
+    faltando = [n for n in ("GR_API_URL", "GR_CLIENT_ID", "GR_CLIENT_SECRET") if not os.getenv(n)]
+    if faltando:
+        return f"envio desligado ({', '.join(faltando)} vazio no .env)"
+    return None
+
+
 @dataclass
 class ConfigEnvio:
     api_url: str

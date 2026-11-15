@@ -10,6 +10,11 @@ Novidade de cada estabelecimento, em relação ao que já foi enviado em execuç
 
 Só entram em `cnpjs_enviados` os resultados definitivos (IMPORTADO, DUPLICADO, BLOQUEADO).
 ERRO não entra, então o CNPJ volta a ser tentado na próxima execução.
+
+Status de uma execução: EM_ANDAMENTO (ou interrompida sem chegar ao fim, até a próxima execução
+marcá-la como INTERROMPIDA), OK, PARCIAL (--limite cortou a lista), SEM_ENVIO, FALHOU, INTERROMPIDA.
+
+`servico_verificacoes` guarda as verificações diárias do servico_prospeccao.py.
 """
 
 from __future__ import annotations
@@ -19,8 +24,9 @@ import os
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
+from typing import Any
 
 CNPJ_INEDITO = "CNPJ_INEDITO"
 FILIAL_NOVA = "FILIAL_NOVA"
@@ -36,7 +42,7 @@ CREATE TABLE IF NOT EXISTS execucoes (
     finalizada_em TEXT,
     mes_base TEXT,
     modo TEXT NOT NULL,              -- 'novos' | 'tudo'
-    status TEXT NOT NULL,            -- 'EM_ANDAMENTO' | 'OK' | 'FALHOU'
+    status TEXT NOT NULL,            -- EM_ANDAMENTO | OK | PARCIAL | SEM_ENVIO | FALHOU | INTERROMPIDA
     contagens TEXT                   -- JSON com as contagens do log
 );
 CREATE TABLE IF NOT EXISTS cnpjs_enviados (
@@ -55,6 +61,16 @@ CREATE TABLE IF NOT EXISTS execucao_itens (
     resultado TEXT NOT NULL,
     PRIMARY KEY (execucao_id, cnpj)
 );
+CREATE TABLE IF NOT EXISTS servico_verificacoes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    em TEXT NOT NULL,
+    data TEXT NOT NULL,              -- AAAA-MM-DD (dia da verificação)
+    origem TEXT NOT NULL,            -- 'servico' | 'manual'
+    mes_receita TEXT,
+    resultado TEXT NOT NULL,
+    detalhe TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_servico_verificacoes_data ON servico_verificacoes(data, origem);
 """
 
 
@@ -75,7 +91,8 @@ class EstadoProspeccao:
         caminho = caminho or os.getenv("PROSPECCAO_ESTADO", "estado/prospeccao.sqlite")
         self.caminho = Path(caminho)
         self.caminho.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.caminho)
+        # timeout: o serviço e a execução (subprocesso) usam o mesmo arquivo
+        self.conn = sqlite3.connect(self.caminho, timeout=30)
         self.conn.executescript(_SCHEMA)
         self.conn.commit()
 
@@ -141,21 +158,90 @@ class EstadoProspeccao:
                         (item.cnpj, item.cnpj_basico, execucao_id, execucao_id, agora, item.resultado),
                     )
 
-    def finalizar_execucao(self, execucao_id: int, status: str, contagens: dict) -> None:
+    def marcar_interrompidas(self) -> int:
+        """Execuções que ficaram EM_ANDAMENTO (computador desligado, processo morto) viram INTERROMPIDA.
+        Só chame com a trava da prospecção na mão: aí nenhuma outra está de fato em andamento."""
+        with self.conn:
+            cur = self.conn.execute(
+                "UPDATE execucoes SET status = 'INTERROMPIDA', finalizada_em = COALESCE(finalizada_em, ?) "
+                "WHERE status = 'EM_ANDAMENTO'",
+                (_agora(),),
+            )
+        return cur.rowcount
+
+    def mes_concluido(self, mes_base: str, aceitar_sem_envio: bool) -> bool:
+        """O mês já teve execução completa? OK sempre conta; SEM_ENVIO só quando o envio está desligado
+        (ao ligar o envio, um mês que só rodou sem envio volta a ficar pendente)."""
+        status = ("OK", "SEM_ENVIO") if aceitar_sem_envio else ("OK",)
+        marcadores = ",".join("?" * len(status))
+        row = self.conn.execute(
+            f"SELECT 1 FROM execucoes WHERE mes_base = ? AND status IN ({marcadores}) LIMIT 1",
+            (mes_base, *status),
+        ).fetchone()
+        return row is not None
+
+    def ultimo_id_execucao(self) -> int:
+        row = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM execucoes").fetchone()
+        return int(row[0])
+
+    def execucao(self, execucao_id: int) -> dict[str, Any] | None:
+        return self._execucao_onde("id = ?", (execucao_id,))
+
+    def finalizar_execucao(self, execucao_id: int, status: str, contagens: dict[str, Any]) -> None:
         with self.conn:
             self.conn.execute(
                 "UPDATE execucoes SET finalizada_em = ?, status = ?, contagens = ? WHERE id = ?",
                 (_agora(), status, json.dumps(contagens, ensure_ascii=False), execucao_id),
             )
 
-    def ultima_execucao(self) -> dict | None:
+    def ultima_execucao(self) -> dict[str, Any] | None:
+        return self._execucao_onde("1 = 1", ())
+
+    def _execucao_onde(self, where: str, params: tuple[Any, ...]) -> dict[str, Any] | None:
         row = self.conn.execute(
             "SELECT id, iniciada_em, finalizada_em, mes_base, modo, status, contagens FROM execucoes "
-            "ORDER BY id DESC LIMIT 1"
+            f"WHERE {where} ORDER BY id DESC LIMIT 1",
+            params,
         ).fetchone()
         if row is None:
             return None
         chaves = ("id", "iniciada_em", "finalizada_em", "mes_base", "modo", "status", "contagens")
-        resultado = dict(zip(chaves, row, strict=True))
+        resultado: dict[str, Any] = dict(zip(chaves, row, strict=True))
         resultado["contagens"] = json.loads(resultado["contagens"]) if resultado["contagens"] else None
         return resultado
+
+    # ── Verificações do serviço ───────────────────────────────────────────────
+
+    def registrar_verificacao(
+        self, origem: str, resultado: str, mes_receita: str | None = None, detalhe: str | None = None
+    ) -> None:
+        agora = datetime.now()
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO servico_verificacoes (em, data, origem, mes_receita, resultado, detalhe) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    agora.isoformat(timespec="seconds"),
+                    agora.date().isoformat(),
+                    origem,
+                    mes_receita,
+                    resultado,
+                    detalhe,
+                ),
+            )
+
+    def verificacoes_do_dia(self, dia: date, origem: str = "servico") -> list[tuple[str, datetime]]:
+        """(resultado, quando) das verificações daquele dia, mais antigas primeiro."""
+        rows = self.conn.execute(
+            "SELECT resultado, em FROM servico_verificacoes WHERE data = ? AND origem = ? ORDER BY id",
+            (dia.isoformat(), origem),
+        ).fetchall()
+        return [(r[0], datetime.fromisoformat(r[1])) for r in rows]
+
+    def ultimas_verificacoes(self, n: int = 5) -> list[dict[str, Any]]:
+        chaves = ("em", "origem", "mes_receita", "resultado", "detalhe")
+        rows = self.conn.execute(
+            "SELECT em, origem, mes_receita, resultado, detalhe FROM servico_verificacoes ORDER BY id DESC LIMIT ?",
+            (n,),
+        ).fetchall()
+        return [dict(zip(chaves, r, strict=True)) for r in rows]
