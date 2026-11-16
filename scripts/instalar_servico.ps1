@@ -9,7 +9,8 @@
 
     1. Exige o Python instalado para todos os usuários (C:\Program Files\Python3xx, >= 3.11)
        e recria o .venv a partir dele, se o atual vier de outro lugar.
-    2. Confere o .env (PROSPECCAO_FILTRO=true, OUTPUT_FORMAT=parquet).
+    2. Confere o .env (só GR_API_URL, GR_CLIENT_ID e GR_CLIENT_SECRET; o resto vem da tela do
+       GestaoRevenda, Configurações → Prospecção Receita).
     3. Baixa o WinSW 2.12.0 (hash SHA-256 fixo) e gera servico\PonteProspeccaoReceita.xml.
     4. Instala o serviço com a conta virtual NT SERVICE\PonteProspeccaoReceita (sem senha, sem
        administrador), com leitura na pasta do projeto e escrita só em logs, estado, saida, temp e parquet.
@@ -89,15 +90,22 @@ $envVars = @{}
 foreach ($linha in Get-Content $envArq -Encoding UTF8) {
     if ($linha -match '^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$') { $envVars[$Matches[1]] = $Matches[2].Trim('"', "'") }
 }
-if ($envVars['PROSPECCAO_FILTRO'] -ne 'true') { Falha 'O .env precisa de PROSPECCAO_FILTRO=true.' }
-if ($envVars['OUTPUT_FORMAT'] -ne 'parquet') {
-    Falha 'O .env precisa de OUTPUT_FORMAT=parquet (o serviço roda sem login, sem o Postgres do Docker Desktop).'
+if ($envVars['OUTPUT_FORMAT'] -and $envVars['OUTPUT_FORMAT'] -ne 'parquet') {
+    Falha 'Tire OUTPUT_FORMAT do .env (ou use parquet): o serviço roda sem login, sem o Postgres do Docker Desktop.'
 }
-$envio = if ($envVars['SERVICO_ENVIO_ATIVO'] -eq 'true') { 'LIGADO' } else { 'desligado (SERVICO_ENVIO_ATIVO=false)' }
+$faltando = @('GR_API_URL', 'GR_CLIENT_ID', 'GR_CLIENT_SECRET') | Where-Object { -not $envVars[$_] }
+if ($faltando) {
+    $envio = "desligado ($($faltando -join ', ') vazio no .env)"
+    Write-Host "    Aviso: $($faltando -join ', ') vazio - o serviço roda com os valores padrão e envio desligado," -ForegroundColor Yellow
+    Write-Host '    sem buscar a configuração nem mandar o resultado ao GestaoRevenda.' -ForegroundColor Yellow
+} else {
+    $envio = 'conforme a tela do GestaoRevenda (Configurações → Prospecção Receita)'
+}
+$antigas = @($envVars.Keys | Where-Object { $_ -match '^(SMTP_|EMAIL_|FILTRO_|SERVICO_)' })
+if ($antigas) {
+    Write-Host "    Aviso: o .env ainda tem $($antigas -join ', ') - não são mais usadas (agora estão na tela)." -ForegroundColor Yellow
+}
 Write-Host "    Envio ao GestaoRevenda: $envio"
-if (-not $envVars['SMTP_HOST'] -or -not $envVars['EMAIL_PARA']) {
-    Write-Host '    Aviso: SMTP_HOST/EMAIL_PARA vazios - o serviço roda, mas sem e-mail (só log).' -ForegroundColor Yellow
-}
 
 # ── 3. Para o serviço, se já existir (o .venv pode estar em uso) ──────────────
 $exe = Join-Path $raiz "servico\$id.exe"

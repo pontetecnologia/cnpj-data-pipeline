@@ -5,17 +5,17 @@
 
 .DESCRIPTION
     Não precisa de administrador. Verifica o mês mais recente da Receita; se ainda não foi
-    processado, confere o disco, roda o fluxo do rodar_mensal e manda o e-mail. Usa a mesma trava
-    do serviço: se ele estiver rodando, este comando sai sem fazer nada (e vice-versa).
-    O envio segue SERVICO_ENVIO_ATIVO e GR_* do .env.
+    processado, confere o disco, roda o fluxo do rodar_mensal e manda o resultado ao GestaoRevenda
+    (que envia o e-mail). Usa a mesma trava do serviço: se ele estiver rodando, este comando sai sem
+    fazer nada (e vice-versa). Configuração e envio ligado/desligado: tela do GestaoRevenda.
 
     scripts\rodar_agora.ps1                  # igual à verificação diária
     scripts\rodar_agora.ps1 -SemEnvio        # gera a lista sem enviar
     scripts\rodar_agora.ps1 -Limite 20       # envia só 20 (primeiro teste real)
     scripts\rodar_agora.ps1 -Forcar          # roda mesmo se o mês já foi processado
     scripts\rodar_agora.ps1 -Recarregar      # baixa e carrega o mês do zero (~30 min)
-    scripts\rodar_agora.ps1 -Status          # verificações, execuções e estado do serviço
-    scripts\rodar_agora.ps1 -TestarEmail     # manda um e-mail de teste
+    scripts\rodar_agora.ps1 -Status          # configuração, verificações, execuções e estado do serviço
+    scripts\rodar_agora.ps1 -TestarConexao   # busca a configuração e manda um sinal ao GestaoRevenda
 #>
 param(
     [switch]$SemEnvio,
@@ -23,7 +23,7 @@ param(
     [switch]$Forcar,
     [switch]$Recarregar,
     [switch]$Status,
-    [switch]$TestarEmail
+    [switch]$TestarConexao
 )
 
 $raiz = Split-Path -Parent $PSScriptRoot
@@ -38,7 +38,7 @@ if ($Status) {
     & $py $script --status
     exit $LASTEXITCODE
 }
-if ($TestarEmail) { & $py $script --testar-email; exit $LASTEXITCODE }
+if ($TestarConexao) { & $py $script --testar-conexao; exit $LASTEXITCODE }
 
 $argumentos = @($script, '--agora')
 if ($SemEnvio) { $argumentos += '--sem-envio' }

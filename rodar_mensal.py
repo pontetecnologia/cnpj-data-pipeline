@@ -10,12 +10,17 @@ Uso:
     python rodar_mensal.py --limite 20     # envia só 20 (primeiro teste real)
     just rodar-mensal [args]
 
-Envio: só acontece com SERVICO_ENVIO_ATIVO=true e GR_* preenchidos no .env; senão a execução roda
-como --sem-envio e registra o motivo (ver enviar_gestaorevenda.motivo_envio_desligado).
+Configuração (filtro, envio ligado/desligado): da tela do GestaoRevenda, Configurações →
+Prospecção Receita (ver config_prospeccao.py). Sem resposta, a última guardada; nunca obtida,
+valores padrão com envio desligado. Envio só com o envio ligado na tela e GR_* preenchidos no
+.env; senão a execução roda como --sem-envio e registra o motivo.
 
-Janela de início de atividade: até a PRIMEIRA execução com envio completo (status OK) usa
-FILTRO_PRIMEIRA_EXECUCAO_MESES (padrão 0 = todas as ativas da região); depois,
-FILTRO_INICIO_ATIVIDADE_MESES (padrão 12). Execuções com --limite (PARCIAL) e --sem-envio não contam.
+Janela de início de atividade: até a PRIMEIRA execução com envio completo (status OK) entram todas
+as ativas da região (0 meses); depois, a "data de abertura mínima" da tela. Execuções com --limite
+(PARCIAL) e --sem-envio não contam.
+
+Filtro mudou desde a carga do mês (outra assinatura no Parquet): o mês é baixado e carregado de
+novo, como com --force.
 
 Uma execução por vez: a trava estado/.prospeccao.lock cobre carga, exportação e envio. Quem
 chega com outra em andamento sai com código 2 sem tocar em nada.
@@ -24,6 +29,7 @@ Retomada: se o processo morrer no meio, a próxima execução marca a anterior c
 retoma downloads (.part) e tabelas Parquet já gravadas, e não reenvia o que o GestaoRevenda já
 aceitou. Os temporários (temp/) só são apagados quando a execução termina bem.
 
+Grava em Parquet (OUTPUT_FORMAT=parquet é o padrão aqui; o serviço roda sem o Postgres do Docker).
 Log: logs/rodar_mensal_AAAA-MM-DD_HHMMSS.log.
 Código de saída: 0 = OK / PARCIAL / SEM_ENVIO, 1 = falha, 2 = outra execução em andamento,
 130 = interrompida (Ctrl+C, parada do serviço).
@@ -44,7 +50,9 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
+import config_prospeccao
 from config import Config
+from config_prospeccao import PRIMEIRA_EXECUCAO_MESES, ConfigProspeccao
 from estado_prospeccao import CNPJ_INEDITO, FILIAL_NOVA, EstadoProspeccao
 from filtro import ContadoresFiltro, FiltroProspeccao
 
@@ -102,11 +110,29 @@ def limpar_temporarios(temp_dir: str) -> int:
     return apagados
 
 
-def _meses_janela(estado: EstadoProspeccao) -> int:
+def _meses_janela(estado: EstadoProspeccao, cfg: ConfigProspeccao) -> int:
     ja_rodou = estado.conn.execute("SELECT 1 FROM execucoes WHERE status = 'OK' LIMIT 1").fetchone() is not None
-    if ja_rodou:
-        return int(os.getenv("FILTRO_INICIO_ATIVIDADE_MESES", "12"))
-    return int(os.getenv("FILTRO_PRIMEIRA_EXECUCAO_MESES", "0"))
+    return cfg.abertura_meses if ja_rodou else PRIMEIRA_EXECUCAO_MESES
+
+
+def assinatura_carregada(pasta_mes: Path) -> str | None:
+    """Assinatura do filtro com que o Parquet do mês foi gravado ("" se não tiver; None se a
+    pasta não tem nenhuma tabela ainda)."""
+    import pyarrow.parquet as pq
+
+    for arquivo in sorted(pasta_mes.glob("*.parquet")):
+        metadados = pq.read_metadata(arquivo).metadata or {}
+        valor = metadados.get(b"cnpj.prospeccaoFiltro")
+        return valor.decode() if valor else ""
+    return None
+
+
+def config_pipeline() -> Config:
+    """Config do pipeline para a prospecção: Parquet, salvo se OUTPUT_FORMAT disser outra coisa."""
+    config = Config.from_env()  # carrega o .env
+    if not os.getenv("OUTPUT_FORMAT"):
+        config = replace(config, output_format="parquet")
+    return config
 
 
 def executar(argv: list[str] | None = None) -> int:
@@ -138,11 +164,7 @@ def _executar(args: argparse.Namespace, caminho_log: Path) -> int:
     if not sys.stderr.isatty():
         os.environ.setdefault("TQDM_DISABLE", "1")  # agendador/serviço: sem barra de progresso no log
 
-    config = Config.from_env()  # carrega o .env
-    if FiltroProspeccao.from_env() is None:
-        logger.error("PROSPECCAO_FILTRO precisa estar ligado (true) no .env para a execução mensal")
-        return CODIGO_FALHA
-
+    config = config_pipeline()
     with trava_prospeccao(caminho_trava()) as obtida:
         if not obtida:
             logger.error("Já há uma execução da prospecção em andamento (serviço ou manual) — nada foi feito")
@@ -155,7 +177,15 @@ def _executar_travado(args: argparse.Namespace, caminho_log: Path, config: Confi
 
     inicio = time.monotonic()
     contagens: dict = {"mes_base": None, "modo": "tudo" if args.tudo else "novos", "log": str(caminho_log)}
-    desligado = None if args.sem_envio else motivo_envio_desligado()
+    cfg = config_prospeccao.obter()
+    logger.info(f"Configuração: {cfg.descrever_origem()}")
+    contagens.update(
+        config_versao=cfg.versao,
+        filtro_versao=cfg.filtro_versao,
+        origem_config=cfg.origem,
+        filtro_chave=cfg.chave_filtro(),
+    )
+    desligado = None if args.sem_envio else motivo_envio_desligado(cfg)
     sem_envio = args.sem_envio or desligado is not None
     if desligado:
         logger.warning(f"{desligado} — rodando como --sem-envio")
@@ -170,13 +200,10 @@ def _executar_travado(args: argparse.Namespace, caminho_log: Path, config: Confi
     execucao_id: int | None = None
     status = "FALHOU"
     try:
-        meses = _meses_janela(estado)
+        meses = _meses_janela(estado, cfg)
 
         def novo_filtro() -> FiltroProspeccao:
-            f = FiltroProspeccao.from_env()
-            assert f is not None
-            f.meses_inicio_atividade = meses  # sem mexer no ambiente do processo
-            return f
+            return cfg.filtro(meses)
 
         filtro = novo_filtro()
         contagens["janela_inicio_atividade_meses"] = meses
@@ -191,7 +218,14 @@ def _executar_travado(args: argparse.Namespace, caminho_log: Path, config: Confi
         if config.output_format == "parquet":
             # Uma pasta por mês: retomar um mês nunca mistura arquivos de outro mês/filtro
             pasta_mes = Path(config.parquet_output_dir) / mes
-            if args.force and pasta_mes.exists():
+            recarregar = args.force
+            if not recarregar and pasta_mes.exists():
+                carregada = assinatura_carregada(pasta_mes)
+                if carregada is not None and carregada != filtro.assinatura():
+                    logger.info(f"Filtro mudou desde a carga de {mes} — baixando e carregando o mês de novo")
+                    contagens["recarga_por_filtro"] = True
+                    recarregar = True
+            if recarregar and pasta_mes.exists():
                 shutil.rmtree(pasta_mes)  # --force no Parquet = exportar o mês do zero
             config = replace(config, parquet_output_dir=str(pasta_mes))
         contadores = ContadoresFiltro()
@@ -205,7 +239,9 @@ def _executar_travado(args: argparse.Namespace, caminho_log: Path, config: Confi
             )
         except SystemExit as e:
             if e.code not in (0, None):
-                raise RuntimeError(f"Carga falhou (código {e.code}) — ver mensagens acima") from e
+                # main() loga o erro e sai com sys.exit(1): a causa fica no contexto do SystemExit
+                causa = f": {e.__context__}" if e.__context__ is not None else " — ver mensagens acima"
+                raise RuntimeError(f"Carga falhou (código {e.code}){causa}") from e
         contagens["linhas_lidas"] = contadores.lidas
         contagens["linhas_filtradas"] = contadores.mantidas
         if not contadores.lidas:
@@ -214,7 +250,14 @@ def _executar_travado(args: argparse.Namespace, caminho_log: Path, config: Confi
         # 3. Exporta + marca novos
         from exportar_prospeccao import escrever_csv, exportar
 
-        linhas, selecionadas, mes_base = exportar(config, novo_filtro(), estado, tudo=args.tudo)
+        filtro_exportacao = novo_filtro()
+        linhas, selecionadas, mes_base = exportar(config, filtro_exportacao, estado, tudo=args.tudo)
+        nao_reconhecidos = sorted(
+            set(filtro.municipios_nao_reconhecidos) | set(filtro_exportacao.municipios_nao_reconhecidos)
+        )
+        if nao_reconhecidos:
+            logger.warning(f"Municípios não reconhecidos (ficaram fora do filtro): {', '.join(nao_reconhecidos)}")
+        contagens["municipios_nao_reconhecidos"] = nao_reconhecidos
         mes_base = mes_base or mes
         novas = sum(1 for linha in linhas if linha["novidade"] in (CNPJ_INEDITO, FILIAL_NOVA))
         contagens.update(
@@ -223,6 +266,7 @@ def _executar_travado(args: argparse.Namespace, caminho_log: Path, config: Confi
             novas_cnpj_inedito=sum(1 for linha in linhas if linha["novidade"] == CNPJ_INEDITO),
             novas_filial=sum(1 for linha in linhas if linha["novidade"] == FILIAL_NOVA),
             selecionadas=len(selecionadas),
+            a_enviar=len(selecionadas),  # antes do --limite: o que uma execução com envio mandaria
         )
         cortada = False
         if args.limite is not None and len(selecionadas) > args.limite:

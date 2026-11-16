@@ -1,4 +1,5 @@
-"""Envio ao GestaoRevenda e rodar_mensal, contra um GestaoRevenda falso (HTTP local)."""
+"""Envio ao GestaoRevenda, configuração pela tela e rodar_mensal, contra um GestaoRevenda falso
+(HTTP local)."""
 
 import csv
 import json
@@ -24,6 +25,24 @@ class FakeGR:
         self.falhar_proximos: list[int] = []  # status HTTP a devolver nas próximas chamadas de import
         self.payloads: list[dict] = []
         self.sem_resultados = False
+        self.escopos = ["leads", "prospeccao-config", "prospeccao-execucoes"]
+        # GET /prospeccao-receita/servico/config (tela Configurações → Prospecção Receita)
+        self.config: dict = {
+            "versao": 1,
+            "filtroVersao": 1,
+            "envioAtivo": True,
+            "filtro": {
+                "cnaes": ["4711-3/02", "4712-1/00", "4711-3/01", "4744-0/99", "4744-0/01", "4530-7/03", "4789-0/04"],
+                "uf": "SC",
+                "municipios": ["JOINVILLE"],
+                "situacoes": ["02"],
+                "aberturaMeses": 12,
+            },
+            "horario": "03:00",
+            "discoMinGb": 25,
+        }
+        self.config_fora_do_ar = False
+        self.recebidos: list[tuple[str, dict]] = []  # sinal/execuções
 
 
 @pytest.fixture
@@ -31,6 +50,17 @@ def fake_gr() -> Iterator[tuple[str, FakeGR]]:
     gr = FakeGR()
 
     class Handler(BaseHTTPRequestHandler):
+        def _autorizado(self) -> bool:
+            return self.headers.get("Authorization") == f"Bearer t{gr.tokens_emitidos}"
+
+        def do_GET(self) -> None:
+            assert self.path == "/api/prospeccao-receita/servico/config"
+            if gr.config_fora_do_ar:
+                return self._json(503, {"message": "fora do ar"})
+            if not self._autorizado():
+                return self._json(401, {"message": "Unauthorized"})
+            return self._json(200, gr.config)
+
         def _json(self, status: int, corpo: object) -> None:
             body = json.dumps(corpo).encode()
             self.send_response(status)
@@ -46,11 +76,14 @@ def fake_gr() -> Iterator[tuple[str, FakeGR]]:
                     return self._json(401, {"message": "Credenciais inválidas"})
                 gr.tokens_emitidos += 1
                 return self._json(
-                    201, {"access_token": f"t{gr.tokens_emitidos}", "expires_in": 3600, "escopos": ["leads"]}
+                    201, {"access_token": f"t{gr.tokens_emitidos}", "expires_in": 3600, "escopos": gr.escopos}
                 )
-            assert self.path == "/api/leads/importar"
-            if self.headers.get("Authorization") != f"Bearer t{gr.tokens_emitidos}":
+            if not self._autorizado():
                 return self._json(401, {"message": "Unauthorized"})
+            if self.path.startswith("/api/prospeccao-receita/servico/"):
+                gr.recebidos.append((self.path.rsplit("/", 1)[-1], corpo))
+                return self._json(201, {"ok": True})
+            assert self.path == "/api/leads/importar"
             if gr.falhar_proximos:
                 return self._json(gr.falhar_proximos.pop(0), {"message": "falha programada"})
             gr.payloads.append(corpo)
@@ -182,6 +215,17 @@ def test_falha_persistente_guarda_o_que_ja_foi(fake_gr: tuple[str, FakeGR], tmp_
     assert list(tmp_path.glob("enviados_2026-10_*.csv"))  # backup parcial gravado
 
 
+def test_escopo_exigido_por_chamada(fake_gr: tuple[str, FakeGR]) -> None:
+    api, gr = fake_gr
+    gr.escopos = ["prospeccao-config"]  # Client sem "leads": lê a configuração, mas não envia
+    cliente = ClienteGestaoRevenda(_cfg(api))
+    assert cliente.requisitar("GET", "/prospeccao-receita/servico/config", "prospeccao-config")["versao"] == 1
+    with pytest.raises(EnvioError, match="escopo 'leads'"):
+        cliente.importar([], "2026-10-01")
+    with pytest.raises(EnvioError, match="escopo 'prospeccao-execucoes'"):
+        cliente.requisitar("POST", "/prospeccao-receita/servico/sinal", "prospeccao-execucoes", {})
+
+
 def test_config_exige_credenciais(monkeypatch: pytest.MonkeyPatch) -> None:
     for nome in ("GR_API_URL", "GR_CLIENT_ID", "GR_CLIENT_SECRET"):
         monkeypatch.delenv(nome, raising=False)
@@ -193,36 +237,39 @@ def test_config_exige_credenciais(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _ambiente_ponta_a_ponta(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, base_url: str, api: str, envio_ativo: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, base_url: str, api: str, gr: FakeGR, envio_ativo: bool
 ) -> None:
+    """Só GR_* (e o que aponta para a Receita falsa e o tmp) no ambiente: filtro, envio ligado e o
+    resto vêm da configuração do GestaoRevenda falso. Sem OUTPUT_FORMAT: o padrão é Parquet."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("config.load_dotenv", lambda *a, **k: False)  # não ler o .env real do projeto
     env = {
         "BASE_URL": base_url,
         "SHARE_TOKEN": "test",
-        "OUTPUT_FORMAT": "parquet",
         "PARQUET_OUTPUT_DIR": str(tmp_path / "parquet"),
         "PARQUET_TYPED_OUTPUT": "true",
         "TEMP_DIR": str(tmp_path / "temp"),
         "RETRY_ATTEMPTS": "1",
         "RETRY_DELAY": "0",
-        "PROSPECCAO_FILTRO": "true",
-        "FILTRO_UF": "SC",
-        "FILTRO_MUNICIPIOS": "JOINVILLE",
-        "FILTRO_INICIO_ATIVIDADE_MESES": "12",
-        "FILTRO_PRIMEIRA_EXECUCAO_MESES": "0",
         "PROSPECCAO_ESTADO": str(tmp_path / "estado.sqlite"),
         "PROSPECCAO_LOGS": str(tmp_path / "logs"),
         "GR_API_URL": api,
         "GR_CLIENT_ID": "id",
         "GR_CLIENT_SECRET": "segredo",
         "GR_LOTE": "1",
-        "SERVICO_ENVIO_ATIVO": envio_ativo,
     }
     for k, v in env.items():
         monkeypatch.setenv(k, v)
-    monkeypatch.delenv("FILTRO_CNAES", raising=False)
-    monkeypatch.delenv("FILTRO_SITUACAO", raising=False)
+    for k in (
+        "OUTPUT_FORMAT",
+        "PROSPECCAO_FILTRO",
+        "FILTRO_CNAES",
+        "FILTRO_SITUACAO",
+        "FILTRO_UF",
+        "FILTRO_MUNICIPIOS",
+    ):
+        monkeypatch.delenv(k, raising=False)
+    gr.config["envioAtivo"] = envio_ativo
 
 
 def test_rodar_mensal_ponta_a_ponta(
@@ -235,7 +282,7 @@ def test_rodar_mensal_ponta_a_ponta(
 
     base_url, _fail, downloads = source_server
     api, gr = fake_gr
-    _ambiente_ponta_a_ponta(monkeypatch, tmp_path, base_url, api, envio_ativo="true")
+    _ambiente_ponta_a_ponta(monkeypatch, tmp_path, base_url, api, gr, envio_ativo=True)
 
     # Teste com --limite: só 1 enviado, os outros continuam novos. PARCIAL não conta como
     # 1ª execução: a próxima continua com a janela de 0 meses e manda o restante.
@@ -258,6 +305,8 @@ def test_rodar_mensal_ponta_a_ponta(
     assert ultima is not None and ultima["status"] == "OK"
     c = ultima["contagens"]
     assert c["janela_inicio_atividade_meses"] == 0
+    assert (c["config_versao"], c["filtro_versao"], c["origem_config"]) == (1, 1, "remota")
+    assert (tmp_path / "parquet" / "2024-01").is_dir()  # Parquet sem OUTPUT_FORMAT no ambiente
     assert c["linhas_lidas"]["estabelecimentos"] == 6 and c["linhas_filtradas"]["estabelecimentos"] == 3
     assert (c["exportadas"], c["novas"]) == (3, 2)  # 11111111000100 já foi no teste com --limite
     assert c["envio"]["enviadas"] == 2 and c["envio"]["importados"] == 2 and c["envio"]["bloqueados"] == 1
@@ -281,32 +330,70 @@ def test_rodar_mensal_envio_desligado(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SERVICO_ENVIO_ATIVO=false: roda tudo como --sem-envio, nada chega ao GestaoRevenda."""
+    """Envio desligado na tela: roda tudo como --sem-envio, nenhum lead chega ao GestaoRevenda."""
     import rodar_mensal
 
     base_url, _fail, _downloads = source_server
     api, gr = fake_gr
-    _ambiente_ponta_a_ponta(monkeypatch, tmp_path, base_url, api, envio_ativo="false")
+    _ambiente_ponta_a_ponta(monkeypatch, tmp_path, base_url, api, gr, envio_ativo=False)
 
     assert rodar_mensal.executar(["--mes", "2024-01"]) == 0
-    assert gr.payloads == [] and gr.tokens_emitidos == 0
+    assert gr.payloads == []
     with EstadoProspeccao(tmp_path / "estado.sqlite") as estado:
         ultima = estado.ultima_execucao()
         # Enquanto o envio está desligado o mês conta como processado; ao ligar, volta a ficar pendente
         assert estado.mes_concluido("2024-01", aceitar_sem_envio=True)
         assert not estado.mes_concluido("2024-01", aceitar_sem_envio=False)
     assert ultima is not None and ultima["status"] == "SEM_ENVIO"
-    assert "SERVICO_ENVIO_ATIVO" in ultima["contagens"]["envio_desligado"]
-    assert ultima["contagens"]["selecionadas"] == 3 and ultima["contagens"]["envio"] is None
+    assert "na tela do GestaoRevenda" in ultima["contagens"]["envio_desligado"]
+    assert ultima["contagens"]["selecionadas"] == 3 and ultima["contagens"]["a_enviar"] == 3
+    assert ultima["contagens"]["envio"] is None
 
-    # GR_* vazio também desliga, mesmo com SERVICO_ENVIO_ATIVO=true
-    monkeypatch.setenv("SERVICO_ENVIO_ATIVO", "true")
+    # GR_* vazio também desliga, mesmo com o envio ligado na tela (e usa a configuração guardada)
+    gr.config["envioAtivo"] = True
     monkeypatch.setenv("GR_CLIENT_SECRET", "")
     assert rodar_mensal.executar(["--mes", "2024-01"]) == 0
     assert gr.payloads == []
     with EstadoProspeccao(tmp_path / "estado.sqlite") as estado:
         ultima = estado.ultima_execucao()
     assert ultima is not None and "GR_CLIENT_SECRET" in ultima["contagens"]["envio_desligado"]
+    assert ultima["contagens"]["origem_config"] == "cache"
+
+
+def test_rodar_mensal_filtro_da_tela_mudou_recarrega(
+    source_server: tuple[str, Event, list[str]],
+    fake_gr: tuple[str, FakeGR],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Filtro alterado na tela: o Parquet do mês (gravado com o filtro antigo) é refeito do zero.
+    Município que a Receita não conhece fica fora do filtro e é informado, sem derrubar a execução."""
+    import rodar_mensal
+
+    base_url, _fail, downloads = source_server
+    api, gr = fake_gr
+    _ambiente_ponta_a_ponta(monkeypatch, tmp_path, base_url, api, gr, envio_ativo=False)
+    assert rodar_mensal.executar(["--mes", "2024-01"]) == 0
+    baixados = len(downloads)
+
+    gr.config["versao"], gr.config["filtroVersao"] = 2, 2
+    gr.config["filtro"]["municipios"] = ["Joinville", "CIDADE QUE NAO EXISTE"]
+    assert rodar_mensal.executar(["--mes", "2024-01"]) == 0  # sem --force
+    with EstadoProspeccao(tmp_path / "estado.sqlite") as estado:
+        ultima = estado.ultima_execucao()
+    assert ultima is not None and ultima["status"] == "SEM_ENVIO"
+    c = ultima["contagens"]
+    assert c["recarga_por_filtro"] is True and len(downloads) > baixados  # baixou e carregou de novo
+    assert c["municipios_nao_reconhecidos"] == ["CIDADE QUE NAO EXISTE"]
+    assert c["exportadas"] == 3 and c["filtro_versao"] == 2
+
+    # Nenhum município reconhecido: erro (senão viraria "a UF inteira")
+    gr.config["filtro"]["municipios"] = ["CIDADE QUE NAO EXISTE"]
+    assert rodar_mensal.executar(["--mes", "2024-01"]) == 1
+    with EstadoProspeccao(tmp_path / "estado.sqlite") as estado:
+        ultima = estado.ultima_execucao()
+    assert ultima is not None and ultima["status"] == "FALHOU"
+    assert "Nenhum dos municípios" in ultima["contagens"]["erro"]
 
 
 def test_rodar_mensal_uma_execucao_por_vez(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -315,19 +402,9 @@ def test_rodar_mensal_uma_execucao_por_vez(monkeypatch: pytest.MonkeyPatch, tmp_
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("config.load_dotenv", lambda *a, **k: False)
-    monkeypatch.setenv("PROSPECCAO_FILTRO", "true")
     monkeypatch.setenv("PROSPECCAO_ESTADO", str(tmp_path / "estado" / "prospeccao.sqlite"))
     monkeypatch.setenv("PROSPECCAO_LOGS", str(tmp_path / "logs"))
     with rodar_mensal.trava_prospeccao(rodar_mensal.caminho_trava()) as obtida:
         assert obtida
         assert rodar_mensal.executar(["--sem-envio"]) == rodar_mensal.CODIGO_OCUPADO
     assert not (tmp_path / "estado" / "prospeccao.sqlite").exists()
-
-
-def test_rodar_mensal_exige_filtro(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    import rodar_mensal
-
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("PROSPECCAO_FILTRO", "false")
-    monkeypatch.setenv("PROSPECCAO_LOGS", str(tmp_path / "logs"))
-    assert rodar_mensal.executar([]) == 1

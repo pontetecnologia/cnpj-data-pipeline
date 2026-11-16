@@ -2,7 +2,7 @@
 """Exporta a lista de prospecção: uma linha por estabelecimento, pronta para o GestaoRevenda.
 
 Lê do PostgreSQL ou do Parquet (via DuckDB) conforme OUTPUT_FORMAT, aplicando o mesmo filtro de
-prospecção da carga (PROSPECCAO_FILTRO e FILTRO_*; ver filtro.py), e marca cada linha como
+prospecção da carga (o da tela do GestaoRevenda; ver config_prospeccao.py), e marca cada linha como
 CNPJ_INEDITO, FILIAL_NOVA ou JA_ENVIADO comparando com o estado local (estado_prospeccao.py).
 
 Uso:
@@ -21,6 +21,7 @@ import json
 import logging
 import re
 import sys
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -389,10 +390,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--saida", type=Path, help="Arquivo CSV de saída (padrão: saida/prospeccao_<mes>.csv)")
     args = parser.parse_args(argv)
 
-    config = Config.from_env()
-    filtro = FiltroProspeccao.from_env()
-    if filtro is None:
-        logger.warning("PROSPECCAO_FILTRO desligado: exportando TODOS os estabelecimentos carregados")
+    import config_prospeccao
+    from rodar_mensal import config_pipeline
+
+    config = config_pipeline()
+    cfg = config_prospeccao.obter()
+    logger.info(f"Filtro: {cfg.descrever_origem()}")
+    filtro = cfg.filtro()
+    if config.output_format == "parquet":
+        meses = sorted(p.name for p in Path(config.parquet_output_dir).glob("????-??") if p.is_dir())
+        if meses:  # rodar_mensal grava uma pasta por mês: exporta a mais recente
+            config = replace(config, parquet_output_dir=str(Path(config.parquet_output_dir) / meses[-1]))
     with EstadoProspeccao() as estado:
         linhas, selecionadas, mes_base = exportar(config, filtro, estado, tudo=args.tudo)
     saida = args.saida or Path("saida") / f"prospeccao_{mes_base or 'sem-mes'}.csv"

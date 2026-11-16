@@ -1,6 +1,8 @@
-"""Filtro de prospecção aplicado durante a carga (opcional, desligado por padrão).
+"""Filtro de prospecção aplicado durante a carga.
 
-Ligado com PROSPECCAO_FILTRO=true. Com ele ligado:
+O serviço e o rodar_mensal montam o filtro a partir da tela do GestaoRevenda
+(config_prospeccao.ConfigProspeccao.filtro). Rodando o pipeline original (main.py) direto, ele
+liga com PROSPECCAO_FILTRO=true e lê FILTRO_* (from_env). Com ele ligado:
 
 - estabelecimentos são filtrados por situação cadastral, CNAE principal, UF, município e data
   mínima de início de atividade;
@@ -8,7 +10,8 @@ Ligado com PROSPECCAO_FILTRO=true. Com ele ligado:
   estabelecimentos (por isso estabelecimentos passa a ser processado ANTES deles);
 - sócios não são baixados nem carregados.
 
-Desligado (padrão), nada neste módulo é usado e o pipeline se comporta exatamente como o upstream.
+No main.py sem PROSPECCAO_FILTRO, nada neste módulo é usado e o pipeline se comporta exatamente
+como o upstream.
 """
 
 from __future__ import annotations
@@ -95,6 +98,11 @@ class FiltroProspeccao:
     hoje: date = field(default_factory=date.today)
     # CNPJs básicos que passaram no filtro de estabelecimentos (preenchido após carregar estabelecimentos)
     cnpjs_basicos: set[str] | None = None
+    # Configuração vinda da tela do GestaoRevenda: município que não está na tabela da Receita (ou
+    # é ambíguo) fica de fora e é listado aqui, em vez de derrubar a execução. Se NENHUM for
+    # reconhecido, ainda é erro (senão o filtro viraria "a UF inteira").
+    tolerar_municipios: bool = False
+    municipios_nao_reconhecidos: list[str] = field(default_factory=list)
 
     # ── Configuração ──────────────────────────────────────────────────────────
 
@@ -149,6 +157,7 @@ class FiltroProspeccao:
             return
 
         codigos: set[str] = set()
+        self.municipios_nao_reconhecidos = []
         por_nome: dict[str, list[str]] = {}
         if self.precisa_tabela_municipios:
             if not tabela:
@@ -161,18 +170,30 @@ class FiltroProspeccao:
                 codigos.add(item.zfill(4))
                 continue
             encontrados = por_nome.get(normalizar_nome(item), [])
+            erro = None
             if not encontrados:
-                raise FiltroInvalidoError(
+                erro = (
                     f"Município não encontrado na tabela da Receita: {item!r}. "
                     "Use o nome como a Receita grafa (ex.: JOINVILLE) ou o código da Receita."
                 )
-            if len(encontrados) > 1 and self.uf is None:
-                raise FiltroInvalidoError(
+            elif len(encontrados) > 1 and self.uf is None:
+                erro = (
                     f"Município {item!r} existe em mais de um estado (códigos {', '.join(sorted(encontrados))}). "
-                    "Defina FILTRO_UF ou use o código da Receita."
+                    "Defina a UF ou use o código da Receita."
                 )
+            if erro:
+                if not self.tolerar_municipios:
+                    raise FiltroInvalidoError(erro)
+                logger.warning(f"{erro} — fica fora do filtro")
+                self.municipios_nao_reconhecidos.append(item)
+                continue
             codigos.update(encontrados)
 
+        if not codigos:
+            raise FiltroInvalidoError(
+                f"Nenhum dos municípios do filtro foi reconhecido ({', '.join(self.municipios_config)}): "
+                "corrija os nomes em Configurações → Prospecção Receita"
+            )
         self.municipios = codigos
         logger.info(f"Filtro: municípios {', '.join(self.municipios_config)} → códigos {', '.join(sorted(codigos))}")
 

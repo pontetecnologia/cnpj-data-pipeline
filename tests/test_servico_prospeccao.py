@@ -1,19 +1,26 @@
-"""Serviço de prospecção: agenda diária, disco, decisão de rodar, e-mail. Sem rede e sem subprocesso."""
+"""Serviço de prospecção: agenda diária, disco, decisão de rodar, aviso ao GestaoRevenda.
+Sem rede e sem subprocesso."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta
+from datetime import time as hora_do_dia
 from pathlib import Path
 from threading import Event
 from typing import Any
 
 import pytest
 
+import aviso_gestaorevenda as aviso
 import servico_prospeccao as sp
+from config_prospeccao import ORIGEM_REMOTA, ConfigProspeccao
 from estado_prospeccao import EstadoProspeccao
-from notificacao import ConfigEmail, enviar_email
 
 CFG = sp.ConfigServico()  # 03:00, 3 tentativas, 60 min entre elas
+REMOTA = ConfigProspeccao(
+    envio_ativo=False, uf="SC", municipios=("JOINVILLE",), versao=3, filtro_versao=2, origem=ORIGEM_REMOTA
+)
 
 
 def _dt(texto: str) -> datetime:
@@ -51,12 +58,10 @@ def test_proxima_verificacao() -> None:
     assert sp.proxima_verificacao(_dt("03:10"), CFG, [(sp.OCUPADO, _dt("03:00"))]) == _dt("04:00")
 
 
-def test_config_servico_horario_invalido(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SERVICO_HORARIO", "3h")
-    with pytest.raises(ValueError, match="HH:MM"):
-        sp.ConfigServico.from_env()
-    monkeypatch.setenv("SERVICO_HORARIO", "02:30")
-    assert sp.ConfigServico.from_env().horario.strftime("%H:%M") == "02:30"
+def test_config_servico_vem_da_tela() -> None:
+    servico = sp.ConfigServico.de(replace(REMOTA, horario=hora_do_dia(2, 30), disco_min_gb=40))
+    assert servico.horario.strftime("%H:%M") == "02:30" and servico.disco_min_gb == 40
+    assert servico.tentativas_dia == 3 and servico.atraso_inicial == timedelta(minutes=10)  # fixos
 
 
 # ── Disco ────────────────────────────────────────────────────────────────────
@@ -99,16 +104,23 @@ def _sem_dotenv(*_a: object, **_k: object) -> bool:
 
 @pytest.fixture
 def ambiente(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any]:
-    """Estado em tmp, Receita e subprocesso falsos, e-mails capturados."""
+    """Estado em tmp, Receita, subprocesso e GestaoRevenda falsos (o que iria para ele é capturado)."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sp, "recarregar_env", lambda: None)
     monkeypatch.setattr("config.load_dotenv", _sem_dotenv)
     monkeypatch.setenv("PROSPECCAO_ESTADO", str(tmp_path / "estado.sqlite"))
     monkeypatch.setenv("PROSPECCAO_LOGS", str(tmp_path / "logs"))
-    monkeypatch.setenv("OUTPUT_FORMAT", "parquet")
     monkeypatch.setenv("TEMP_DIR", str(tmp_path / "temp"))
-    monkeypatch.setenv("SERVICO_ENVIO_ATIVO", "false")
-    ctx: dict[str, Any] = {"mes": "2026-11", "emails": [], "execucoes": [], "status_filho": "SEM_ENVIO", "codigo": 0}
+    for nome, valor in (("GR_API_URL", "http://gr/api"), ("GR_CLIENT_ID", "id"), ("GR_CLIENT_SECRET", "segredo")):
+        monkeypatch.setenv(nome, valor)
+    ctx: dict[str, Any] = {
+        "mes": "2026-11",
+        "cfg": REMOTA,
+        "execucoes": [],
+        "status_filho": "SEM_ENVIO",
+        "codigo": 0,
+        "gr": [],  # (tipo, payload) entregues ao GestaoRevenda
+    }
 
     def mes_mais_recente(_self: object) -> str:
         return ctx["mes"]
@@ -116,29 +128,45 @@ def ambiente(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any]:
     def checar_disco(*_a: object) -> str | None:
         return ctx.get("disco")
 
-    def enviar_email(assunto: str, corpo: str) -> bool:
-        ctx["emails"].append((assunto, corpo))
-        return True
+    def obter() -> ConfigProspeccao:
+        return ctx["cfg"]
+
+    def enviar_fila(estado: EstadoProspeccao, cliente: Any = None) -> tuple[int, int]:
+        itens = estado.pendentes_fila()
+        for item_id, tipo, _chave, payload in itens:
+            ctx["gr"].append((tipo, payload))
+            estado.remover_da_fila(item_id)
+        return len(itens), 0
 
     monkeypatch.setattr("downloader.Downloader.get_latest_directory", mes_mais_recente)
     monkeypatch.setattr(sp, "checar_disco", checar_disco)
-    monkeypatch.setattr("notificacao.enviar_email", enviar_email)
+    monkeypatch.setattr(sp.config_prospeccao, "obter", obter)
+    monkeypatch.setattr(sp.aviso, "enviar_fila", enviar_fila)
 
     def rodar_fluxo(mes: str, _parar: Event, **kwargs: Any) -> int:
         ctx["execucoes"].append((mes, kwargs))
         if ctx["status_filho"] is not None:
+            cfg: ConfigProspeccao = ctx["cfg"]
             with EstadoProspeccao() as estado:
                 execucao_id = estado.iniciar_execucao(mes, "novos")
                 contagens: dict[str, Any] = {
                     "mes_base": mes,
                     "linhas_lidas": {"estabelecimentos": 100},
                     "linhas_filtradas": {"estabelecimentos": 10},
+                    "exportadas": 9,
                     "novas": 7,
+                    "selecionadas": 7,
+                    "a_enviar": 7,
                     "envio": {"enviadas": 7, "importados": 5, "duplicados": 1, "bloqueados": 0, "erros": 1},
+                    "config_versao": cfg.versao,
+                    "filtro_versao": cfg.filtro_versao,
+                    "origem_config": cfg.origem,
+                    "filtro_chave": cfg.chave_filtro(),
+                    "municipios_nao_reconhecidos": ["CIDADE X"],
                 }
                 if ctx["status_filho"] == "SEM_ENVIO":
                     contagens["envio"] = None
-                    contagens["envio_desligado"] = "envio desligado (SERVICO_ENVIO_ATIVO=false no .env)"
+                    contagens["envio_desligado"] = "envio desligado na tela do GestaoRevenda"
                 if ctx["status_filho"] == "FALHOU":
                     contagens["erro"] = "Lote recusado (400)"
                 estado.finalizar_execucao(execucao_id, ctx["status_filho"], contagens)
@@ -148,31 +176,58 @@ def ambiente(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any]:
     return ctx
 
 
+def _entregues(ctx: dict[str, Any], tipo: str) -> list[dict[str, Any]]:
+    return [p for t, p in ctx["gr"] if t == tipo]
+
+
 def test_verificar_envio_desligado_roda_uma_vez_por_mes(ambiente: dict[str, Any]) -> None:
     assert sp.verificar("servico", Event()) == sp.EXECUTADO
     assert len(ambiente["execucoes"]) == 1
-    assunto, corpo = ambiente["emails"][0]
-    assert "envio desligado" in assunto and "2026-11" in assunto
-    assert "ENVIO DESLIGADO" in corpo and "Linhas lidas da Receita:   100" in corpo
+    [execucao] = _entregues(ambiente, "execucao")
+    assert execucao["status"] == "SEM_ENVIO" and execucao["mesBase"] == "2026-11"
+    assert "na tela" in execucao["envioDesligado"]
+    assert (execucao["lidas"], execucao["filtradas"], execucao["novas"], execucao["enviadas"]) == (100, 10, 7, 0)
+    assert execucao["configVersao"] == 3 and execucao["municipiosNaoReconhecidos"] == ["CIDADE X"]
+    assert execucao["chave"].startswith("exec:")
+    assert execucao["terminadaEm"][19:] != ""  # com fuso: o GestaoRevenda não desloca 3 horas
+    [sinal] = _entregues(ambiente, "sinal")
+    # A próxima execução com envio mandaria os 7 que a execução sem envio selecionou
+    assert sinal["pendentesEnvio"] == 7 and sinal["pendentesMes"] == "2026-11" and sinal["pendentesFiltroVersao"] == 2
+    assert sinal["configVersaoAplicada"] == 3 and sinal["ultimaVerificacao"]["resultado"] == sp.EXECUTADO
 
-    # Dia seguinte, mesmo mês, envio ainda desligado: nada a fazer, sem e-mail
+    # Dia seguinte, mesmo mês, envio ainda desligado: nada a fazer; só o sinal vai
+    ambiente["gr"].clear()
     assert sp.verificar("servico", Event()) == sp.SEM_NOVIDADE
-    assert len(ambiente["execucoes"]) == 1 and len(ambiente["emails"]) == 1
+    assert len(ambiente["execucoes"]) == 1
+    assert _entregues(ambiente, "execucao") == []
+    assert _entregues(ambiente, "sinal")[0]["ultimaVerificacao"]["resultado"] == sp.SEM_NOVIDADE
 
 
-def test_verificar_ligar_envio_reabre_o_mes(ambiente: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+def test_verificar_ligar_envio_reabre_o_mes(ambiente: dict[str, Any]) -> None:
     assert sp.verificar("servico", Event()) == sp.EXECUTADO  # SEM_ENVIO
-    monkeypatch.setenv("SERVICO_ENVIO_ATIVO", "true")
-    monkeypatch.setenv("GR_API_URL", "http://gr/api")
-    monkeypatch.setenv("GR_CLIENT_ID", "id")
-    monkeypatch.setenv("GR_CLIENT_SECRET", "segredo")
+    ambiente["cfg"] = replace(REMOTA, envio_ativo=True, versao=4)
     ambiente["status_filho"] = "OK"
     assert sp.verificar("servico", Event()) == sp.EXECUTADO
     assert len(ambiente["execucoes"]) == 2
-    assunto, corpo = ambiente["emails"][-1]
-    assert assunto.startswith("[Prospecção Receita] OK 2026-11 — 7 novas, 7 enviadas")
-    assert "recusados (erro):        1" in corpo and "duplicados:              1" in corpo
+    execucao = _entregues(ambiente, "execucao")[-1]
+    assert execucao["status"] == "OK" and execucao["envioDesligado"] is None
+    assert (execucao["enviadas"], execucao["importadas"], execucao["duplicadas"], execucao["recusadas"]) == (7, 5, 1, 1)
+    assert _entregues(ambiente, "sinal")[-1]["pendentesEnvio"] == 0
     # Agora o mês está concluído mesmo com envio ligado
+    assert sp.verificar("servico", Event()) == sp.SEM_NOVIDADE
+
+
+def test_verificar_filtro_alterado_recarrega_na_proxima_verificacao(ambiente: dict[str, Any]) -> None:
+    assert sp.verificar("servico", Event()) == sp.EXECUTADO
+    assert ambiente["execucoes"][-1][1]["recarregar"] is False
+    # Mudou o município na tela: o mês já processado volta a rodar, baixando e carregando de novo
+    ambiente["cfg"] = replace(REMOTA, municipios=("JOINVILLE", "BLUMENAU"), versao=4, filtro_versao=3)
+    assert sp.verificar("servico", Event()) == sp.EXECUTADO
+    assert ambiente["execucoes"][-1][1]["recarregar"] is True
+    # Já recarregado com o filtro novo: nada a fazer
+    assert sp.verificar("servico", Event()) == sp.SEM_NOVIDADE
+    # Mudar só o horário ou o disco não muda o filtro
+    ambiente["cfg"] = replace(ambiente["cfg"], horario=hora_do_dia(4, 0), disco_min_gb=30, versao=5)
     assert sp.verificar("servico", Event()) == sp.SEM_NOVIDADE
 
 
@@ -180,19 +235,30 @@ def test_verificar_falha_avisa_e_conta_como_verificacao_do_dia(ambiente: dict[st
     ambiente["status_filho"] = "FALHOU"
     ambiente["codigo"] = 1
     assert sp.verificar("servico", Event()) == sp.FALHOU
-    assunto, corpo = ambiente["emails"][0]
-    assert "FALHOU 2026-11 — Lote recusado (400)" in assunto and "Erro: Lote recusado (400)" in corpo
+    [execucao] = _entregues(ambiente, "execucao")
+    assert execucao["status"] == "FALHOU" and execucao["erro"] == "Lote recusado (400)"
     with EstadoProspeccao() as estado:
         regs = estado.verificacoes_do_dia(datetime.now().date())
     assert [r for r, _ in regs] == [sp.FALHOU]
     assert not sp.verificacao_devida(datetime.combine(datetime.now().date(), CFG.horario), CFG, regs)
 
 
+def test_verificar_subprocesso_sem_registro_avisa_falha(ambiente: dict[str, Any]) -> None:
+    ambiente["status_filho"] = None
+    ambiente["codigo"] = 1
+    assert sp.verificar("servico", Event()) == sp.FALHOU
+    [execucao] = _entregues(ambiente, "execucao")
+    assert execucao["status"] == "FALHOU" and "sem registrar" in execucao["erro"]
+    assert execucao["chave"].startswith("erro:")
+
+
 def test_verificar_disco_insuficiente_pula_e_avisa(ambiente: dict[str, Any]) -> None:
-    ambiente["disco"] = "espaço insuficiente em C:: 3.0 GB livres; mínimo 25 GB (SERVICO_DISCO_MIN_GB)"
+    ambiente["disco"] = "espaço insuficiente em C:: 3.0 GB livres; mínimo 25 GB"
     assert sp.verificar("servico", Event()) == sp.DISCO_INSUFICIENTE
     assert ambiente["execucoes"] == []
-    assert "PULADA 2026-11" in ambiente["emails"][0][0] and "3.0 GB livres" in ambiente["emails"][0][1]
+    [execucao] = _entregues(ambiente, "execucao")
+    assert execucao["status"] == "DISCO_INSUFICIENTE" and "3.0 GB livres" in execucao["erro"]
+    assert execucao["chave"].startswith("pulada:")
 
 
 def test_verificar_ocupado_e_interrompido_nao_avisam(ambiente: dict[str, Any]) -> None:
@@ -202,7 +268,7 @@ def test_verificar_ocupado_e_interrompido_nao_avisam(ambiente: dict[str, Any]) -
 
     ambiente["codigo"] = sp.CODIGO_INTERROMPIDA
     assert sp.verificar("servico", Event()) == sp.INTERROMPIDO
-    assert ambiente["emails"] == []
+    assert _entregues(ambiente, "execucao") == []
     with EstadoProspeccao() as estado:
         regs = estado.verificacoes_do_dia(datetime.now().date())
     assert [r for r, _ in regs] == [sp.OCUPADO]  # interrompido não registra: continua devida
@@ -214,7 +280,20 @@ def test_verificar_receita_fora_do_ar(ambiente: dict[str, Any], monkeypatch: pyt
 
     monkeypatch.setattr("downloader.Downloader.get_latest_directory", falha)
     assert sp.verificar("servico", Event()) == sp.FALHA_VERIFICACAO
-    assert ambiente["execucoes"] == [] and ambiente["emails"] == []
+    assert ambiente["execucoes"] == [] and _entregues(ambiente, "execucao") == []
+    assert _entregues(ambiente, "sinal")[0]["ultimaVerificacao"]["resultado"] == sp.FALHA_VERIFICACAO
+
+
+def test_verificar_erro_inesperado_vira_falha_avisada(
+    ambiente: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def explode(*_a: object, **_k: object) -> str:
+        raise RuntimeError("disco sumiu")
+
+    monkeypatch.setattr(sp, "checar_disco", explode)
+    assert sp.verificar("servico", Event()) == sp.FALHOU
+    [execucao] = _entregues(ambiente, "execucao")
+    assert execucao["status"] == "FALHOU" and "disco sumiu" in execucao["erro"]
 
 
 def test_verificar_forcar_roda_mes_ja_processado(ambiente: dict[str, Any]) -> None:
@@ -224,6 +303,17 @@ def test_verificar_forcar_roda_mes_ja_processado(ambiente: dict[str, Any]) -> No
         "2026-11",
         {"sem_envio": False, "limite": 20, "recarregar": False, "console": False},
     )
+    assert _entregues(ambiente, "execucao")[-1]["origem"] == "manual"
+
+
+def test_pendentes_de_envio_por_status() -> None:
+    def execucao(status: str, **c: Any) -> dict[str, Any]:
+        return {"status": status, "contagens": c}
+
+    assert aviso.a_enviar_pendentes(execucao("SEM_ENVIO", a_enviar=7174)) == 7174
+    assert aviso.a_enviar_pendentes(execucao("PARCIAL", a_enviar=7174, envio={"enviadas": 20})) == 7154
+    assert aviso.a_enviar_pendentes(execucao("OK", a_enviar=7154, envio={"enviadas": 7154})) == 0
+    assert aviso.a_enviar_pendentes(execucao("SEM_ENVIO")) is None  # execução antiga, sem a contagem
 
 
 def test_estado_marca_execucoes_orfas(tmp_path: Path) -> None:
@@ -233,6 +323,19 @@ def test_estado_marca_execucoes_orfas(tmp_path: Path) -> None:
         execucao = estado.execucao(orfa)
         assert execucao is not None and execucao["status"] == "INTERROMPIDA"
         assert not estado.mes_concluido("2026-10", aceitar_sem_envio=True)
+
+
+def test_estado_fila_e_instancia(tmp_path: Path) -> None:
+    with EstadoProspeccao(tmp_path / "e.sqlite") as estado:
+        instancia = estado.instancia()
+        assert instancia == estado.instancia() and len(instancia) == 12
+        estado.enfileirar("sinal", "sinal", {"n": 1})
+        estado.enfileirar("execucao", "exec:a:1", {"x": 1})
+        estado.enfileirar("sinal", "sinal", {"n": 2})  # o sinal guarda só o mais recente
+        itens = estado.pendentes_fila()
+        assert [(t, p) for _, t, _, p in itens] == [("execucao", {"x": 1}), ("sinal", {"n": 2})]
+        estado.remover_da_fila(itens[0][0])
+        assert estado.tamanho_fila() == 1
 
 
 def test_limpar_logs_antigos(tmp_path: Path) -> None:
@@ -248,68 +351,3 @@ def test_limpar_logs_antigos(tmp_path: Path) -> None:
     os.utime(outro, (antigo, antigo))
     assert sp.limpar_logs_antigos(tmp_path, 365) == 1
     assert not velho.exists() and novo.exists() and outro.exists()
-
-
-# ── E-mail ───────────────────────────────────────────────────────────────────
-
-
-class FakeSMTP:
-    instancias: list[FakeSMTP] = []
-
-    def __init__(self, host: str, porta: int, **kwargs: Any) -> None:
-        self.host, self.porta, self.kwargs = host, porta, kwargs
-        self.chamadas: list[str] = []
-        self.mensagens: list[Any] = []
-        FakeSMTP.instancias.append(self)
-
-    def __enter__(self) -> FakeSMTP:
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.chamadas.append("quit")
-
-    def starttls(self, **kwargs: Any) -> None:
-        self.chamadas.append("starttls")
-
-    def login(self, usuario: str, senha: str) -> None:
-        if senha != "certa":
-            raise OSError("535 autenticação recusada")
-        self.chamadas.append(f"login:{usuario}")
-
-    def send_message(self, msg: Any) -> None:
-        self.mensagens.append(msg)
-
-
-def _cfg_email(senha: str = "certa") -> ConfigEmail:
-    return ConfigEmail("smtp.exemplo", 587, "starttls", "eu@exemplo.com", senha, "eu@exemplo.com", ["a@x", "b@x"])
-
-
-def test_enviar_email_starttls() -> None:
-    FakeSMTP.instancias.clear()
-    assert enviar_email("Assunto ç", "Corpo ã", _cfg_email(), smtp_factory=FakeSMTP)
-    smtp = FakeSMTP.instancias[0]
-    assert (smtp.host, smtp.porta) == ("smtp.exemplo", 587)
-    assert smtp.chamadas == ["starttls", "login:eu@exemplo.com", "quit"]
-    msg = smtp.mensagens[0]
-    assert msg["To"] == "a@x, b@x" and msg["Subject"] == "Assunto ç" and "Corpo ã" in msg.get_content()
-
-
-def test_enviar_email_falha_nao_levanta() -> None:
-    assert enviar_email("x", "y", _cfg_email(senha="errada"), smtp_factory=FakeSMTP) is False
-
-
-def test_config_email_do_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for nome in ("SMTP_HOST", "EMAIL_PARA", "EMAIL_DE", "SMTP_PORTA", "SMTP_SEGURANCA"):
-        monkeypatch.delenv(nome, raising=False)
-    assert ConfigEmail.from_env() is None  # não configurado: só log
-    assert enviar_email("x", "y") is False
-    monkeypatch.setenv("SMTP_HOST", "smtp.gmail.com")
-    monkeypatch.setenv("SMTP_USUARIO", "eu@gmail.com")
-    monkeypatch.setenv("EMAIL_PARA", "eu@gmail.com, outro@x")
-    cfg = ConfigEmail.from_env()
-    assert cfg is not None
-    assert (cfg.porta, cfg.seguranca, cfg.remetente) == (587, "starttls", "eu@gmail.com")
-    assert cfg.destinatarios == ["eu@gmail.com", "outro@x"]
-    monkeypatch.setenv("SMTP_SEGURANCA", "tls")
-    with pytest.raises(ValueError, match="SMTP_SEGURANCA"):
-        ConfigEmail.from_env()

@@ -14,3 +14,5 @@ saida/
 logs/
 # Serviço Windows: WinSW baixado e XML gerado pelo instalador
 servico/
+# Backup local das variáveis que saíram do .env (sem credenciais)
+.env.antes-da-tela

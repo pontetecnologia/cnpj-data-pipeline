@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 """Serviço Windows "Ponte - Prospecção Receita" (WinSW roda este script; ver scripts/instalar_servico.ps1).
 
-Uma vez por dia, a partir de SERVICO_HORARIO (padrão 03:00), verifica se a Receita publicou mês
-novo. Se o mês mais recente ainda não foi processado, confere o disco e roda rodar_mensal.py
-(subprocesso) para ele; se já foi, não faz nada. Ao terminar, manda um e-mail com as contagens ou
-com o erro.
+A configuração vem do GestaoRevenda (Configurações → Prospecção Receita; ver config_prospeccao.py),
+buscada a cada 15 min. Uma vez por dia, a partir do horário da tela (padrão 03:00), verifica se a
+Receita publicou mês novo. Se o mês mais recente ainda não foi processado, confere o disco e roda
+rodar_mensal.py (subprocesso) para ele; se já foi, não faz nada. O resultado de cada execução e um
+sinal de vida a cada verificação vão para o GestaoRevenda (aviso_gestaorevenda.py), que guarda o
+histórico e manda o e-mail.
 
-- Computador desligado às 03:00: a verificação do dia roda SERVICO_ATRASO_INICIAL_MIN depois de ligar.
-- "Mês processado" = há execução OK para ele (ou SEM_ENVIO, enquanto o envio estiver desligado).
-  Um mês carregado mas não enviado, ou interrompido no meio, continua pendente e é retomado.
-- Receita fora do ar ou outra execução em andamento: nova tentativa a cada
-  SERVICO_INTERVALO_TENTATIVA_MIN, até SERVICO_TENTATIVAS_DIA vezes no dia.
-- Disco: exige SERVICO_DISCO_MIN_GB livres (descontado o que já está em TEMP_DIR, que é retomado).
-- O .env é relido a cada ciclo: mudar SERVICO_ENVIO_ATIVO ou o horário não exige reiniciar o serviço.
+- Computador desligado no horário: a verificação do dia roda 10 min depois de ligar.
+- "Mês processado" = há execução OK para ele (ou SEM_ENVIO, enquanto o envio estiver desligado),
+  feita com o filtro atual da tela. Filtro alterado → o mês é baixado e recarregado na próxima
+  verificação programada (nunca na hora de salvar a tela).
+- Receita fora do ar ou outra execução em andamento: nova tentativa a cada 60 min, até 3 no dia.
+- Disco: exige o mínimo da tela (padrão 25 GB), descontado o que já está em TEMP_DIR.
+- No .env ficam só GR_API_URL, GR_CLIENT_ID e GR_CLIENT_SECRET (relidos a cada ciclo).
 
 Uso:
-    python servico_prospeccao.py                  # laço do serviço (o WinSW chama assim)
-    python servico_prospeccao.py --agora          # verifica e roda agora, em primeiro plano
+    python servico_prospeccao.py                    # laço do serviço (o WinSW chama assim)
+    python servico_prospeccao.py --agora            # verifica e roda agora, em primeiro plano
         [--sem-envio] [--limite N] [--forcar] [--recarregar]
-    python servico_prospeccao.py --status         # última verificação, execuções, próxima verificação
-    python servico_prospeccao.py --testar-email   # manda um e-mail de teste
+    python servico_prospeccao.py --status           # configuração, verificações, execuções, fila
+    python servico_prospeccao.py --testar-conexao   # busca a configuração e manda um sinal
 """
 
 from __future__ import annotations
@@ -45,12 +47,16 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+import aviso_gestaorevenda as aviso
+import config_prospeccao
+from config_prospeccao import ConfigProspeccao
 from estado_prospeccao import EstadoProspeccao
-from rodar_mensal import CODIGO_INTERROMPIDA, CODIGO_OCUPADO
+from rodar_mensal import CODIGO_INTERROMPIDA, CODIGO_OCUPADO, config_pipeline
 
 RAIZ = Path(__file__).resolve().parent
 NOME_SERVICO = "Ponte - Prospecção Receita"
 GB = 1024**3
+INTERVALO_CONFIG = timedelta(minutes=15)
 
 logger = logging.getLogger("servico")
 
@@ -67,6 +73,8 @@ RETENTAVEIS = (OCUPADO, FALHA_VERIFICACAO)
 
 @dataclass
 class ConfigServico:
+    """Horário e disco vêm da tela; o resto é fixo."""
+
     horario: hora_do_dia = hora_do_dia(3, 0)
     atraso_inicial: timedelta = timedelta(minutes=10)
     disco_min_gb: float = 25.0
@@ -75,21 +83,8 @@ class ConfigServico:
     logs_manter_dias: int = 365
 
     @classmethod
-    def from_env(cls) -> ConfigServico:
-        texto = os.getenv("SERVICO_HORARIO", "03:00").strip()
-        try:
-            h, m = (int(p) for p in texto.split(":"))
-            horario = hora_do_dia(h, m)
-        except ValueError as e:
-            raise ValueError(f"SERVICO_HORARIO deve ser HH:MM (veio {texto!r})") from e
-        return cls(
-            horario=horario,
-            atraso_inicial=timedelta(minutes=float(os.getenv("SERVICO_ATRASO_INICIAL_MIN", "10"))),
-            disco_min_gb=float(os.getenv("SERVICO_DISCO_MIN_GB", "25")),
-            tentativas_dia=max(1, int(os.getenv("SERVICO_TENTATIVAS_DIA", "3"))),
-            intervalo_tentativa=timedelta(minutes=float(os.getenv("SERVICO_INTERVALO_TENTATIVA_MIN", "60"))),
-            logs_manter_dias=int(os.getenv("SERVICO_LOGS_MANTER_DIAS", "365")),
-        )
+    def de(cls, cfg: ConfigProspeccao) -> ConfigServico:
+        return cls(horario=cfg.horario, disco_min_gb=cfg.disco_min_gb)
 
 
 def recarregar_env() -> None:
@@ -118,7 +113,7 @@ def verificacao_devida(agora: datetime, cfg: ConfigServico, registros_hoje: list
 
 
 def proxima_verificacao(agora: datetime, cfg: ConfigServico, registros_hoje: list[tuple[str, datetime]]) -> datetime:
-    """Quando a próxima verificação deve acontecer (para o --status e o log)."""
+    """Quando a próxima verificação deve acontecer (para o --status, o log e o sinal)."""
     hoje = datetime.combine(agora.date(), cfg.horario)
     amanha = hoje + timedelta(days=1)
     if agora < hoje:
@@ -172,7 +167,7 @@ def checar_disco(min_gb: float, temp_dir: Path, outras: list[Path]) -> str | Non
             extra = f" + {credito / GB:.1f} GB reaproveitáveis em {temp_dir}" if credito else ""
             return (
                 f"espaço insuficiente em {unidade}: {livre / GB:.1f} GB livres{extra}; "
-                f"mínimo {min_gb:g} GB (SERVICO_DISCO_MIN_GB)"
+                f"mínimo {min_gb:g} GB (Configurações → Prospecção Receita)"
             )
     return None
 
@@ -240,67 +235,34 @@ def rodar_fluxo(
         return proc.wait()
 
 
-def _ultimas_linhas(caminho: str | None, n: int = 30) -> str:
-    if not caminho or not Path(caminho).exists():
-        return ""
-    with open(caminho, encoding="utf-8", errors="replace") as f:
-        return "".join(f.readlines()[-n:])
+def filtro_mudou(execucao: dict[str, Any] | None, cfg: ConfigProspeccao) -> bool:
+    """A execução que concluiu o mês foi feita com outro filtro da tela? (Execuções de antes da
+    configuração pela tela não têm a chave: não forçam recarga.)"""
+    contagens: dict[str, Any] = (execucao or {}).get("contagens") or {}
+    chave = contagens.get("filtro_chave")
+    return bool(chave) and chave != cfg.chave_filtro()
 
 
-def montar_aviso(mes: str, execucao: dict[str, Any] | None, codigo: int) -> tuple[str, str]:
-    """Assunto e corpo do e-mail de fim de execução."""
-    execucao = execucao or {}
-    c: dict[str, Any] = execucao.get("contagens") or {}
-    status: str = execucao.get("status") or "FALHOU"
-    envio: dict[str, Any] = c.get("envio") or {}
-    lidas_tabela: dict[str, int] = c.get("linhas_lidas") or {}
-    filtradas_tabela: dict[str, int] = c.get("linhas_filtradas") or {}
-    lidas = sum(lidas_tabela.values())
-    filtradas = sum(filtradas_tabela.values())
-    desligado: str | None = c.get("envio_desligado")
-
-    if status in ("OK", "PARCIAL", "SEM_ENVIO"):
-        rotulo = {"OK": "OK", "PARCIAL": "OK PARCIAL", "SEM_ENVIO": "OK (envio desligado)"}[status]
-        assunto = (
-            f"[Prospecção Receita] {rotulo} {mes} — {c.get('novas', 0):,} novas, {envio.get('enviadas', 0):,} enviadas"
-        )
-    else:
-        erro = c.get("erro") or f"rodar_mensal saiu com código {codigo} sem registrar a execução"
-        assunto = f"[Prospecção Receita] FALHOU {mes} — {erro[:120]}"
-
-    linhas = [f"Mês da Receita: {mes}", f"Status: {status}"]
-    if desligado:
-        linhas.append(f"ENVIO DESLIGADO: {desligado}. Nada foi enviado ao GestaoRevenda.")
-    if c.get("limite"):
-        linhas.append(f"Envio limitado a {c['limite']} (--limite): o restante segue como novo para a próxima.")
-    linhas += [
-        "",
-        "Contagens",
-        f"  Linhas lidas da Receita:   {lidas:,}" + ("   (mês já carregado antes)" if not lidas else ""),
-        f"  Linhas após o filtro:      {filtradas:,}",
-        f"  Estabelecimentos na lista: {c.get('exportadas', 0):,}",
-        f"  Novos:                     {c.get('novas', 0):,}"
-        f"  (CNPJ inédito {c.get('novas_cnpj_inedito', 0):,}, filial nova {c.get('novas_filial', 0):,})",
-        f"  Enviados:                  {envio.get('enviadas', 0):,}",
-        f"    importados:              {envio.get('importados', 0):,}  (bloqueados {envio.get('bloqueados', 0):,})",
-        f"    duplicados:              {envio.get('duplicados', 0):,}",
-        f"    recusados (erro):        {envio.get('erros', 0):,}",
-        "",
-        f"Janela de início de atividade: {c.get('janela_inicio_atividade_meses', '?')} meses",
-        f"Duração: {c.get('duracao_min', '?')} min",
-    ]
-    if c.get("csv_lista"):
-        linhas.append(f"Lista: {RAIZ / c['csv_lista']}")
-    if envio.get("backup"):
-        linhas.append(f"Backup do envio: {RAIZ / envio['backup']}")
-    if c.get("log"):
-        linhas.append(f"Log: {RAIZ / c['log']}")
-    if status not in ("OK", "PARCIAL", "SEM_ENVIO"):
-        linhas += ["", f"Erro: {c.get('erro', '(sem detalhe)')}", "", "Últimas linhas do log:"]
-        linhas.append(_ultimas_linhas(c.get("log")) or "(sem log — ver logs/rodar_mensal_saida.txt)")
-        linhas += ["", "A próxima verificação diária tenta de novo, retomando de onde parou."]
-    linhas += ["", f"Computador: {os.getenv('COMPUTERNAME', '?')}  ·  {NOME_SERVICO}"]
-    return assunto, "\n".join(linhas)
+def _avisar(
+    estado: EstadoProspeccao,
+    cfg: ConfigProspeccao,
+    envio_desligado: str | None,
+    mes: str | None,
+    execucao: dict[str, Any] | None = None,
+) -> None:
+    """Põe na fila a execução (se houver) e o sinal, e tenta mandar tudo ao GestaoRevenda."""
+    if execucao is not None:
+        aviso.enfileirar_execucao(estado, execucao)
+    registros = estado.verificacoes_do_dia(datetime.now().date())
+    proxima = proxima_verificacao(datetime.now(), ConfigServico.de(cfg), registros)
+    aviso.enfileirar_sinal(
+        estado, aviso.payload_sinal(estado, cfg, envio_desligado=envio_desligado, proxima=proxima, mes_receita=mes)
+    )
+    enviados, ficaram = aviso.enviar_fila(estado)
+    if ficaram:
+        logger.warning(f"{ficaram} aviso(s) para o GestaoRevenda ficaram na fila (vão no próximo ciclo)")
+    elif enviados:
+        logger.info(f"Resultado enviado ao GestaoRevenda ({enviados} item(ns))")
 
 
 def verificar(
@@ -319,26 +281,27 @@ def verificar(
     except Exception as e:  # nunca deixa o laço do serviço repetir a cada minuto por um erro inesperado
         logger.exception(f"Verificação falhou: {e}")
         with EstadoProspeccao() as estado:
-            estado.registrar_verificacao(origem, FALHOU, detalhe=str(e)[:500])
-        from notificacao import enviar_email
-
-        enviar_email(f"[Prospecção Receita] FALHOU — {str(e)[:120]}", f"A verificação falhou:\n\n{e}")
+            vid = estado.registrar_verificacao(origem, FALHOU, detalhe=str(e)[:500])
+            cfg = config_prospeccao.obter()
+            payload = aviso.payload_sem_execucao(
+                f"erro:{estado.instancia()}:{vid}", origem, None, "FALHOU", f"A verificação falhou: {e}", cfg
+            )
+            _avisar(estado, cfg, None, None, payload)
         return FALHOU
 
 
 def _verificar(
     origem: str, parar: Event, sem_envio: bool, limite: int | None, forcar: bool, recarregar: bool, console: bool
 ) -> str:
-    from config import Config
     from downloader import Downloader
     from enviar_gestaorevenda import motivo_envio_desligado
-    from notificacao import enviar_email
 
     recarregar_env()
-    cfg = ConfigServico.from_env()
-    config = Config.from_env()
-    if config.output_format != "parquet":
-        logger.warning("OUTPUT_FORMAT não é parquet: a carga depende do Postgres (Docker) estar no ar")
+    cfg = config_prospeccao.obter()
+    logger.info(f"Configuração: {cfg.descrever_origem()}")
+    servico = ConfigServico.de(cfg)
+    config = config_pipeline()
+    envio_desligado = "--sem-envio" if sem_envio else motivo_envio_desligado(cfg)
 
     try:
         mes = Downloader(config).get_latest_directory()
@@ -346,32 +309,37 @@ def _verificar(
         logger.warning(f"Não consegui listar os meses da Receita: {e}")
         with EstadoProspeccao() as estado:
             estado.registrar_verificacao(origem, FALHA_VERIFICACAO, detalhe=str(e)[:500])
+            _avisar(estado, cfg, envio_desligado, None)
         return FALHA_VERIFICACAO
 
-    desligado = sem_envio or motivo_envio_desligado() is not None
     with EstadoProspeccao() as estado:
-        concluido = estado.mes_concluido(mes, aceitar_sem_envio=desligado)
-        if concluido and not (forcar or recarregar):
+        concluida = estado.ultima_concluida(mes, aceitar_sem_envio=envio_desligado is not None)
+        mudou = filtro_mudou(concluida, cfg)
+        if concluida and not (mudou or forcar or recarregar):
             logger.info(f"Mês mais recente da Receita: {mes} — já processado, nada a fazer")
             estado.registrar_verificacao(origem, SEM_NOVIDADE, mes, "já processado")
+            _avisar(estado, cfg, envio_desligado, mes)
             return SEM_NOVIDADE
         antes = estado.ultimo_id_execucao()
-    logger.info(f"Mês mais recente da Receita: {mes} — " + ("reprocessando (--forcar)" if concluido else "pendente"))
+    if mudou and not recarregar:
+        logger.info(f"Filtro alterado na tela (configuração v{cfg.versao}) — o mês {mes} será baixado e recarregado")
+        recarregar = True
+    situacao = "reprocessando (--forcar)" if concluida and not mudou else "pendente"
+    logger.info(f"Mês mais recente da Receita: {mes} — {situacao}")
 
     motivo = checar_disco(
-        cfg.disco_min_gb,
+        servico.disco_min_gb,
         Path(config.temp_dir),
         [Path(tempfile.gettempdir()), Path(config.parquet_output_dir)],
     )
     if motivo:
         logger.error(f"Execução pulada: {motivo}")
         with EstadoProspeccao() as estado:
-            estado.registrar_verificacao(origem, DISCO_INSUFICIENTE, mes, motivo)
-        enviar_email(
-            f"[Prospecção Receita] PULADA {mes} — espaço em disco insuficiente",
-            f"A execução do mês {mes} não foi feita: {motivo}.\n\n"
-            "Libere espaço; a próxima verificação diária tenta de novo.",
-        )
+            vid = estado.registrar_verificacao(origem, DISCO_INSUFICIENTE, mes, motivo)
+            payload = aviso.payload_sem_execucao(
+                f"pulada:{estado.instancia()}:{vid}", origem, mes, DISCO_INSUFICIENTE, motivo, cfg
+            )
+            _avisar(estado, cfg, envio_desligado, mes, payload)
         return DISCO_INSUFICIENTE
 
     codigo = rodar_fluxo(mes, parar, sem_envio=sem_envio, limite=limite, recarregar=recarregar, console=console)
@@ -391,10 +359,22 @@ def _verificar(
         status = execucao["status"] if execucao else None
         resultado = EXECUTADO if status in ("OK", "PARCIAL", "SEM_ENVIO") else FALHOU
         detalhe = json.dumps({"status": status, "codigo": codigo}, ensure_ascii=False)
-        estado.registrar_verificacao(origem, resultado, mes, detalhe)
-    logger.info(f"Execução do mês {mes} terminou: {status or 'sem registro'} (código {codigo})")
-    assunto, corpo = montar_aviso(mes, execucao, codigo)
-    enviar_email(assunto, corpo)
+        vid = estado.registrar_verificacao(origem, resultado, mes, detalhe)
+        logger.info(f"Execução do mês {mes} terminou: {status or 'sem registro'} (código {codigo})")
+        if execucao is not None:
+            payload = aviso.payload_execucao(execucao, origem, estado.instancia(), cfg)
+            contagens_execucao: dict[str, Any] = execucao.get("contagens") or {}
+            envio_desligado = contagens_execucao.get("envio_desligado", envio_desligado)
+        else:
+            payload = aviso.payload_sem_execucao(
+                f"erro:{estado.instancia()}:{vid}",
+                origem,
+                mes,
+                "FALHOU",
+                f"rodar_mensal saiu com código {codigo} sem registrar a execução (ver logs/rodar_mensal_saida.txt)",
+                cfg,
+            )
+        _avisar(estado, cfg, envio_desligado, mes, payload)
     return resultado
 
 
@@ -414,31 +394,55 @@ def limpar_logs_antigos(pasta: Path, dias: int) -> int:
     return apagados
 
 
+def atualizar_config(atual: ConfigProspeccao | None) -> ConfigProspeccao:
+    """Busca a configuração e manda o que estiver na fila. Loga quando a versão muda."""
+    recarregar_env()
+    cfg = config_prospeccao.obter()
+    if atual is None or (cfg.versao, cfg.origem) != (atual.versao, atual.origem):
+        logger.info(f"Configuração: {cfg.descrever_origem()}")
+    with EstadoProspeccao() as estado:
+        aviso.enviar_fila(estado)
+    return cfg
+
+
 def laco(parar: Event, agora: type[datetime] = datetime) -> None:
     inicio = agora.now()
-    cfg = ConfigServico.from_env()
+    cfg = atualizar_config(None)
+    servico = ConfigServico.de(cfg)
+    ultima_busca = agora.now()
     logger.info(
-        f"{NOME_SERVICO} iniciado (verificação diária às {cfg.horario:%H:%M}; "
-        f"primeira checagem em {cfg.atraso_inicial.total_seconds() / 60:g} min)"
+        f"{NOME_SERVICO} iniciado (verificação diária às {servico.horario:%H:%M}; "
+        f"primeira checagem em {servico.atraso_inicial.total_seconds() / 60:g} min)"
     )
+    try:
+        from enviar_gestaorevenda import motivo_envio_desligado
+
+        with EstadoProspeccao() as estado:
+            _avisar(estado, cfg, motivo_envio_desligado(cfg), None)
+    except Exception as e:
+        logger.warning(f"Sinal inicial não enviado: {e}")
     while not parar.is_set():
         espera = 60.0
         try:
-            recarregar_env()
-            cfg = ConfigServico.from_env()
             instante = agora.now()
-            if instante - inicio >= cfg.atraso_inicial:
+            if instante - ultima_busca >= INTERVALO_CONFIG:
+                cfg = atualizar_config(cfg)
+                ultima_busca = instante
+            servico = ConfigServico.de(cfg)
+            if instante - inicio >= servico.atraso_inicial:
                 with EstadoProspeccao() as estado:
                     registros = estado.verificacoes_do_dia(instante.date())
-                if verificacao_devida(instante, cfg, registros):
+                if verificacao_devida(instante, servico, registros):
                     verificar("servico", parar)
+                    cfg = atualizar_config(cfg)
+                    ultima_busca = agora.now()
                     if not parar.is_set():
                         with EstadoProspeccao() as estado:
                             registros = estado.verificacoes_do_dia(agora.now().date())
-                        proxima = proxima_verificacao(agora.now(), cfg, registros)
+                        proxima = proxima_verificacao(agora.now(), ConfigServico.de(cfg), registros)
                         logger.info(f"Próxima verificação: {proxima:%Y-%m-%d %H:%M}")
-                    limpar_logs_antigos(pasta_logs(), cfg.logs_manter_dias)
-        except Exception as e:  # configuração inválida no .env etc.: registra e espera mais
+                    limpar_logs_antigos(pasta_logs(), servico.logs_manter_dias)
+        except Exception as e:
             logger.exception(f"Erro no ciclo do serviço: {e} — nova tentativa em 15 min")
             espera = 900.0
         parar.wait(espera)
@@ -467,7 +471,8 @@ def configurar_log(manual: bool) -> None:
 def mostrar_status() -> int:
     from enviar_gestaorevenda import motivo_envio_desligado
 
-    cfg = ConfigServico.from_env()
+    cfg = config_prospeccao.obter()
+    servico = ConfigServico.de(cfg)
     agora = datetime.now()
     with EstadoProspeccao() as estado:
         registros = estado.verificacoes_do_dia(agora.date())
@@ -475,10 +480,18 @@ def mostrar_status() -> int:
         execucoes = estado.conn.execute(
             "SELECT id, iniciada_em, mes_base, status, contagens FROM execucoes ORDER BY id DESC LIMIT 5"
         ).fetchall()
+        fila = estado.tamanho_fila()
     print(f"{NOME_SERVICO}")
-    print(f"  Envio ao GestaoRevenda: {motivo_envio_desligado() or 'LIGADO'}")
-    proxima = proxima_verificacao(agora, cfg, registros)
-    print(f"  Verificação diária às {cfg.horario:%H:%M}; próxima: {proxima:%Y-%m-%d %H:%M}")
+    print(f"  Configuração: {cfg.descrever_origem()}")
+    print(f"  Envio ao GestaoRevenda: {motivo_envio_desligado(cfg) or 'LIGADO'}")
+    uf = cfg.uf or "todas"
+    municipios = ", ".join(cfg.municipios) or "todos"
+    print(f"  Filtro: CNAEs {', '.join(cfg.cnaes)}; UF {uf}; municípios {municipios}")
+    abertura = f"últimos {cfg.abertura_meses} meses" if cfg.abertura_meses else "sem limite"
+    print(f"          situação {', '.join(cfg.situacoes)}; abertura: {abertura}")
+    proxima = proxima_verificacao(agora, servico, registros)
+    print(f"  Verificação diária às {servico.horario:%H:%M}; próxima: {proxima:%Y-%m-%d %H:%M}")
+    print(f"  Disco mínimo: {servico.disco_min_gb:g} GB · avisos na fila para o GestaoRevenda: {fila}")
     print("\nÚltimas verificações:")
     for v in verificacoes or [{"em": "-", "origem": "", "mes_receita": "", "resultado": "(nenhuma)", "detalhe": ""}]:
         print(f"  {v['em']}  {v['origem']:<8} {v['mes_receita'] or '':<8} {v['resultado']:<19} {v['detalhe'] or ''}")
@@ -493,12 +506,26 @@ def mostrar_status() -> int:
     return 0
 
 
+def testar_conexao() -> int:
+    """Busca a configuração e manda um sinal agora. 0 = as duas coisas funcionaram."""
+    from enviar_gestaorevenda import motivo_envio_desligado
+
+    cfg = config_prospeccao.obter()
+    print(f"Configuração: {cfg.descrever_origem()}")
+    with EstadoProspeccao() as estado:
+        _avisar(estado, cfg, motivo_envio_desligado(cfg), None)
+        fila = estado.tamanho_fila()
+    ok = cfg.origem == config_prospeccao.ORIGEM_REMOTA and fila == 0
+    print("Sinal enviado ao GestaoRevenda." if fila == 0 else f"Sinal NÃO enviado: {fila} item(ns) na fila (ver log).")
+    return 0 if ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=f"Serviço {NOME_SERVICO}")
     modo = parser.add_mutually_exclusive_group()
     modo.add_argument("--agora", action="store_true", help="Verifica e roda agora, em primeiro plano")
-    modo.add_argument("--status", action="store_true", help="Mostra verificações e execuções recentes")
-    modo.add_argument("--testar-email", action="store_true", help="Manda um e-mail de teste")
+    modo.add_argument("--status", action="store_true", help="Mostra configuração, verificações e execuções")
+    modo.add_argument("--testar-conexao", action="store_true", help="Busca a configuração e manda um sinal")
     parser.add_argument("--sem-envio", action="store_true", help="(--agora) não envia ao GestaoRevenda")
     parser.add_argument("--limite", type=int, help="(--agora) envia só as N primeiras")
     parser.add_argument("--forcar", action="store_true", help="(--agora) roda mesmo se o mês já foi processado")
@@ -512,15 +539,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.status:
         return mostrar_status()
 
-    configurar_log(manual=args.agora or args.testar_email)
-    if args.testar_email:
-        from notificacao import enviar_email
-
-        ok = enviar_email(
-            "[Prospecção Receita] e-mail de teste",
-            f"Teste do aviso do serviço {NOME_SERVICO} em {os.getenv('COMPUTERNAME', '?')}.",
-        )
-        return 0 if ok else 1
+    configurar_log(manual=args.agora or args.testar_conexao)
+    if args.testar_conexao:
+        return testar_conexao()
 
     # Com TMP/TEMP apontando para temp\sys (XML do WinSW), garante que a pasta exista
     Path(tempfile.gettempdir()).mkdir(parents=True, exist_ok=True)

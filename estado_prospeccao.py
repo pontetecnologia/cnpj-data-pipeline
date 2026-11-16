@@ -15,6 +15,7 @@ Status de uma execução: EM_ANDAMENTO (ou interrompida sem chegar ao fim, até 
 marcá-la como INTERROMPIDA), OK, PARCIAL (--limite cortou a lista), SEM_ENVIO, FALHOU, INTERROMPIDA.
 
 `servico_verificacoes` guarda as verificações diárias do servico_prospeccao.py.
+`fila_gestaorevenda` guarda as execuções e o sinal que ainda não chegaram ao GestaoRevenda.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -71,6 +73,21 @@ CREATE TABLE IF NOT EXISTS servico_verificacoes (
     detalhe TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_servico_verificacoes_data ON servico_verificacoes(data, origem);
+-- O que ainda não chegou ao GestaoRevenda (execuções e o último sinal). Reenviado no próximo
+-- ciclo; a chave torna o reenvio idempotente lá.
+CREATE TABLE IF NOT EXISTS fila_gestaorevenda (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tipo TEXT NOT NULL,              -- 'execucao' | 'sinal'
+    chave TEXT NOT NULL UNIQUE,
+    payload TEXT NOT NULL,
+    criado_em TEXT NOT NULL,
+    tentativas INTEGER NOT NULL DEFAULT 0,
+    ultimo_erro TEXT
+);
+CREATE TABLE IF NOT EXISTS meta (
+    chave TEXT PRIMARY KEY,
+    valor TEXT NOT NULL
+);
 """
 
 
@@ -172,13 +189,17 @@ class EstadoProspeccao:
     def mes_concluido(self, mes_base: str, aceitar_sem_envio: bool) -> bool:
         """O mês já teve execução completa? OK sempre conta; SEM_ENVIO só quando o envio está desligado
         (ao ligar o envio, um mês que só rodou sem envio volta a ficar pendente)."""
+        return self.ultima_concluida(mes_base, aceitar_sem_envio) is not None
+
+    def ultima_concluida(self, mes_base: str, aceitar_sem_envio: bool) -> dict[str, Any] | None:
+        """A execução mais recente que conclui o mês (ver mes_concluido), ou None."""
         status = ("OK", "SEM_ENVIO") if aceitar_sem_envio else ("OK",)
         marcadores = ",".join("?" * len(status))
-        row = self.conn.execute(
-            f"SELECT 1 FROM execucoes WHERE mes_base = ? AND status IN ({marcadores}) LIMIT 1",
-            (mes_base, *status),
-        ).fetchone()
-        return row is not None
+        return self._execucao_onde(f"mes_base = ? AND status IN ({marcadores})", (mes_base, *status))
+
+    def ultima_com_status(self, *status: str) -> dict[str, Any] | None:
+        marcadores = ",".join("?" * len(status))
+        return self._execucao_onde(f"status IN ({marcadores})", status)
 
     def ultimo_id_execucao(self) -> int:
         row = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM execucoes").fetchone()
@@ -214,10 +235,10 @@ class EstadoProspeccao:
 
     def registrar_verificacao(
         self, origem: str, resultado: str, mes_receita: str | None = None, detalhe: str | None = None
-    ) -> None:
+    ) -> int:
         agora = datetime.now()
         with self.conn:
-            self.conn.execute(
+            cur = self.conn.execute(
                 "INSERT INTO servico_verificacoes (em, data, origem, mes_receita, resultado, detalhe) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (
@@ -229,6 +250,7 @@ class EstadoProspeccao:
                     detalhe,
                 ),
             )
+        return int(cur.lastrowid or 0)
 
     def verificacoes_do_dia(self, dia: date, origem: str = "servico") -> list[tuple[str, datetime]]:
         """(resultado, quando) das verificações daquele dia, mais antigas primeiro."""
@@ -245,3 +267,47 @@ class EstadoProspeccao:
             (n,),
         ).fetchall()
         return [dict(zip(chaves, r, strict=True)) for r in rows]
+
+    # ── Instalação e fila para o GestaoRevenda ────────────────────────────────
+
+    def instancia(self) -> str:
+        """Identificador desta instalação (gerado uma vez): entra na chave das execuções enviadas
+        ao GestaoRevenda, para dois computadores (ou um estado recriado) nunca colidirem."""
+        row = self.conn.execute("SELECT valor FROM meta WHERE chave = 'instancia'").fetchone()
+        if row:
+            return str(row[0])
+        valor = uuid.uuid4().hex[:12]
+        with self.conn:
+            self.conn.execute("INSERT OR IGNORE INTO meta (chave, valor) VALUES ('instancia', ?)", (valor,))
+        row = self.conn.execute("SELECT valor FROM meta WHERE chave = 'instancia'").fetchone()
+        return str(row[0])
+
+    def enfileirar(self, tipo: str, chave: str, payload: dict[str, Any]) -> None:
+        """Mesma chave substitui o conteúdo (o sinal guarda só o mais recente)."""
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO fila_gestaorevenda (tipo, chave, payload, criado_em) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(chave) DO UPDATE SET payload = excluded.payload",
+                (tipo, chave, json.dumps(payload, ensure_ascii=False), _agora()),
+            )
+
+    def pendentes_fila(self) -> list[tuple[int, str, str, dict[str, Any]]]:
+        """(id, tipo, chave, payload) — execuções antes do sinal, mais antigas primeiro."""
+        rows = self.conn.execute(
+            "SELECT id, tipo, chave, payload FROM fila_gestaorevenda ORDER BY tipo = 'sinal', id"
+        ).fetchall()
+        return [(int(r[0]), str(r[1]), str(r[2]), json.loads(r[3])) for r in rows]
+
+    def remover_da_fila(self, item_id: int) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM fila_gestaorevenda WHERE id = ?", (item_id,))
+
+    def falha_na_fila(self, item_id: int, erro: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE fila_gestaorevenda SET tentativas = tentativas + 1, ultimo_erro = ? WHERE id = ?",
+                (erro[:500], item_id),
+            )
+
+    def tamanho_fila(self) -> int:
+        return int(self.conn.execute("SELECT COUNT(*) FROM fila_gestaorevenda").fetchone()[0])

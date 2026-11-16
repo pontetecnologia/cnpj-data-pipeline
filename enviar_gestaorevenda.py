@@ -3,15 +3,18 @@
 
 Autenticação OAuth2 client-credentials do módulo api-clients do GestaoRevenda (POST /api/auth/token,
 token de 1h, renovado antes de vencer). Client ID/Secret gerados em Configurações > API Externa,
-com o escopo "leads". Credenciais SÓ por variável de ambiente (.env):
+com os escopos "leads" (envio), "prospeccao-config" (ler a configuração) e "prospeccao-execucoes"
+(gravar execução e sinal). Credenciais SÓ no .env:
 
     GR_API_URL=https://<backend>/api      # base da API, com o /api
     GR_CLIENT_ID=...
     GR_CLIENT_SECRET=...
-    GR_LOTE=200                            # linhas por requisição (máx. 1000 no backend)
-    GR_TENTATIVAS=4                        # tentativas por lote (rede, 5xx, 429)
-    GR_TIMEOUT=300                         # segundos por requisição
-    GR_ENFILEIRAR_CNPJA=false              # true = backend também consulta a cnpja.com (lento)
+
+Ajustes opcionais (fora do .env.example; os padrões servem): GR_LOTE=200 (linhas por requisição,
+máx. 1000), GR_TENTATIVAS=4 (rede, 5xx, 429), GR_TIMEOUT=300 (segundos por requisição),
+GR_ENFILEIRAR_CNPJA=false (true = o backend também consulta a cnpja.com, lento).
+
+Se envia ou não (e o filtro, o horário...) vem da tela do GestaoRevenda: ver config_prospeccao.py.
 
 Reenviar um lote que o servidor já processou (timeout depois do processamento) não duplica nada:
 o GestaoRevenda deduplica por CNPJ e devolve DUPLICADO.
@@ -25,35 +28,49 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import requests
 
 from estado_prospeccao import EstadoProspeccao, ItemResultado
 from exportar_prospeccao import COLUNAS_CSV, escrever_csv
 
+if TYPE_CHECKING:
+    from config_prospeccao import ConfigProspeccao
+
 logger = logging.getLogger(__name__)
 
 ORIGEM = "RECEITA_FEDERAL"
 MARGEM_TOKEN_S = 120
+VARIAVEIS_GR = ("GR_API_URL", "GR_CLIENT_ID", "GR_CLIENT_SECRET")
+ESCOPO_LEADS = "leads"
 
 
 class EnvioError(RuntimeError):
     """Falha que não adianta repetir (credencial, payload recusado, backend sem suporte)."""
 
 
-def motivo_envio_desligado() -> str | None:
-    """None se o envio ao GestaoRevenda está liberado; senão o motivo (vai para o log e o e-mail).
+def credenciais_faltando() -> list[str]:
+    return [n for n in VARIAVEIS_GR if not os.getenv(n)]
 
-    Envio só com SERVICO_ENVIO_ATIVO=true (padrão false: liga-se depois do deploy do backend)
-    E com GR_API_URL / GR_CLIENT_ID / GR_CLIENT_SECRET preenchidos. Vale para o serviço, para o
-    rodar_agora e para o rodar_mensal chamado direto.
+
+def motivo_envio_desligado(cfg: ConfigProspeccao) -> str | None:
+    """None se o envio ao GestaoRevenda está liberado; senão o motivo (vai para o log e o aviso).
+
+    Envia só com GR_* preenchidos no .env E com o envio ligado na tela do GestaoRevenda. Se o
+    serviço nunca conseguiu buscar a configuração, não envia. Vale para o serviço, o rodar_agora
+    e o rodar_mensal chamado direto.
     """
-    if os.getenv("SERVICO_ENVIO_ATIVO", "false").strip().lower() != "true":
-        return "envio desligado (SERVICO_ENVIO_ATIVO=false no .env)"
-    faltando = [n for n in ("GR_API_URL", "GR_CLIENT_ID", "GR_CLIENT_SECRET") if not os.getenv(n)]
+    from config_prospeccao import ORIGEM_PADRAO
+
+    faltando = credenciais_faltando()
     if faltando:
         return f"envio desligado ({', '.join(faltando)} vazio no .env)"
+    if cfg.origem == ORIGEM_PADRAO:
+        detalhe = f": {cfg.erro_busca}" if cfg.erro_busca else ""
+        return f"envio desligado (configuração nunca obtida do GestaoRevenda{detalhe})"
+    if not cfg.envio_ativo:
+        return "envio desligado na tela do GestaoRevenda (Configurações → Prospecção Receita)"
     return None
 
 
@@ -70,7 +87,7 @@ class ConfigEnvio:
 
     @classmethod
     def from_env(cls) -> ConfigEnvio:
-        faltando = [n for n in ("GR_API_URL", "GR_CLIENT_ID", "GR_CLIENT_SECRET") if not os.getenv(n)]
+        faltando = credenciais_faltando()
         if faltando:
             raise EnvioError(f"Defina no .env: {', '.join(faltando)}")
         cfg = cls(
@@ -116,11 +133,18 @@ class ClienteGestaoRevenda:
         self.session = session or requests.Session()
         self.sleep = sleep
         self._token: str | None = None
+        self._escopos: list[str] = []
         self._expira_em = 0.0
 
-    def _obter_token(self) -> str:
-        if self._token and time.monotonic() < self._expira_em - MARGEM_TOKEN_S:
-            return self._token
+    def _obter_token(self, escopo: str = ESCOPO_LEADS) -> str:
+        if not (self._token and time.monotonic() < self._expira_em - MARGEM_TOKEN_S):
+            self._renovar_token()
+        if escopo not in self._escopos:
+            raise EnvioError(f"O Client ID não tem o escopo '{escopo}' (Configurações > API Externa)")
+        assert self._token is not None
+        return self._token
+
+    def _renovar_token(self) -> None:
         resp = self.session.post(
             f"{self.cfg.api_url}/auth/token",
             json={
@@ -134,55 +158,72 @@ class ClienteGestaoRevenda:
             raise EnvioError(f"Credenciais recusadas pelo GestaoRevenda ({resp.status_code}): {resp.text[:200]}")
         resp.raise_for_status()
         corpo = resp.json()
-        if "leads" not in (corpo.get("escopos") or []):
-            raise EnvioError("O Client ID não tem o escopo 'leads' (Configurações > API Externa)")
         self._token = corpo["access_token"]
+        self._escopos = list(corpo.get("escopos") or [])
         self._expira_em = time.monotonic() + int(corpo.get("expires_in", 3600))
-        return self._token
 
-    def importar(self, rows: list[dict], data_base: str) -> dict:
-        """Um lote, com novas tentativas para rede/5xx/429 e renovação de token em 401."""
-        payload = {
-            "origem": ORIGEM,
-            "dataBase": data_base,
-            "enfileirarConsultaCnpj": self.cfg.enfileirar_cnpja,
-            "rows": rows,
-        }
+    def requisitar(
+        self,
+        metodo: str,
+        caminho: str,
+        escopo: str,
+        corpo: dict[str, Any] | None = None,
+        *,
+        tentativas: int | None = None,
+        timeout: float | None = None,
+        rotulo: str = "Requisição",
+    ) -> dict[str, Any]:
+        """Chamada autenticada com novas tentativas para rede/5xx/429 e renovação de token em 401.
+        4xx (fora 401/429) é EnvioError: não adianta repetir."""
+        tentativas = tentativas or self.cfg.tentativas
         ultimo_erro: Exception | None = None
-        for tentativa in range(1, self.cfg.tentativas + 1):
+        for tentativa in range(1, tentativas + 1):
             try:
-                resp = self.session.post(
-                    f"{self.cfg.api_url}/leads/importar",
-                    json=payload,
-                    headers={"Authorization": f"Bearer {self._obter_token()}"},
-                    timeout=self.cfg.timeout,
+                resp = self.session.request(
+                    metodo,
+                    f"{self.cfg.api_url}{caminho}",
+                    json=corpo,
+                    headers={"Authorization": f"Bearer {self._obter_token(escopo)}"},
+                    timeout=timeout or self.cfg.timeout,
                 )
                 if resp.status_code == 401:
                     self._token = None  # token revogado/expirado antes da hora: renova e repete
                     raise requests.HTTPError("401", response=resp)
                 if resp.status_code in (429,) or resp.status_code >= 500:
                     raise requests.HTTPError(f"{resp.status_code}", response=resp)
-                if resp.status_code >= 400:
-                    raise EnvioError(f"Lote recusado ({resp.status_code}): {resp.text[:500]}")
-                corpo = resp.json()
-                if "resultados" not in corpo:
+                if resp.status_code == 404:
                     raise EnvioError(
-                        "Resposta sem 'resultados' — o backend do GestaoRevenda não tem a importação com origem "
-                        "(LeadsService.importarReceita). Atualize o backend antes de enviar."
+                        f"{rotulo}: {caminho} não existe no GestaoRevenda (404) — o backend está desatualizado?"
                     )
-                return corpo
+                if resp.status_code >= 400:
+                    raise EnvioError(f"{rotulo} recusado ({resp.status_code}): {resp.text[:500]}")
+                return resp.json()
             except EnvioError:
                 raise
             except (requests.RequestException, ValueError) as e:
                 ultimo_erro = e
-                if tentativa == self.cfg.tentativas:
+                if tentativa == tentativas:
                     break
                 espera = self.cfg.espera_base * 2 ** (tentativa - 1)
-                logger.warning(
-                    f"Lote falhou (tentativa {tentativa}/{self.cfg.tentativas}): {e} — nova em {espera:.0f}s"
-                )
+                logger.warning(f"{rotulo} falhou (tentativa {tentativa}/{tentativas}): {e} — nova em {espera:.0f}s")
                 self.sleep(espera)
-        raise RuntimeError(f"Lote falhou após {self.cfg.tentativas} tentativas: {ultimo_erro}")
+        raise RuntimeError(f"{rotulo} falhou após {tentativas} tentativas: {ultimo_erro}")
+
+    def importar(self, rows: list[dict], data_base: str) -> dict:
+        """Um lote de leads (escopo "leads")."""
+        payload = {
+            "origem": ORIGEM,
+            "dataBase": data_base,
+            "enfileirarConsultaCnpj": self.cfg.enfileirar_cnpja,
+            "rows": rows,
+        }
+        corpo = self.requisitar("POST", "/leads/importar", ESCOPO_LEADS, payload, rotulo="Lote")
+        if "resultados" not in corpo:
+            raise EnvioError(
+                "Resposta sem 'resultados' — o backend do GestaoRevenda não tem a importação com origem "
+                "(LeadsService.importarReceita). Atualize o backend antes de enviar."
+            )
+        return corpo
 
 
 def linha_para_payload(linha: dict) -> dict:
