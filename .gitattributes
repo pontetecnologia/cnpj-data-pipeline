@@ -1,0 +1,2 @@
+# Arquivos .cmd precisam de CRLF para o cmd.exe
+*.cmd text eol=crlf

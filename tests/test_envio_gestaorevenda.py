@@ -307,7 +307,9 @@ def test_rodar_mensal_ponta_a_ponta(
     assert c["janela_inicio_atividade_meses"] == 0
     assert (c["config_versao"], c["filtro_versao"], c["origem_config"]) == (1, 1, "remota")
     assert (tmp_path / "parquet" / "2024-01").is_dir()  # Parquet sem OUTPUT_FORMAT no ambiente
-    assert c["linhas_lidas"]["estabelecimentos"] == 6 and c["linhas_filtradas"]["estabelecimentos"] == 3
+    # Base rápida: a carga guarda a UF inteira (os 6 são de SC); a seleção filtra depois
+    assert c["linhas_lidas"]["estabelecimentos"] == 6 and c["linhas_filtradas"]["estabelecimentos"] == 6
+    assert c["uf_base"] == "SC"
     assert (c["exportadas"], c["novas"]) == (3, 2)  # 11111111000100 já foi no teste com --limite
     assert c["envio"]["enviadas"] == 2 and c["envio"]["importados"] == 2 and c["envio"]["bloqueados"] == 1
     assert list((tmp_path / "logs").glob("rodar_mensal_*.log"))
@@ -360,14 +362,15 @@ def test_rodar_mensal_envio_desligado(
     assert ultima["contagens"]["origem_config"] == "cache"
 
 
-def test_rodar_mensal_filtro_da_tela_mudou_recarrega(
+def test_rodar_mensal_filtro_da_tela_mudou_nao_baixa_de_novo(
     source_server: tuple[str, Event, list[str]],
     fake_gr: tuple[str, FakeGR],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Filtro alterado na tela: o Parquet do mês (gravado com o filtro antigo) é refeito do zero.
-    Município que a Receita não conhece fica fora do filtro e é informado, sem derrubar a execução."""
+    """Filtro alterado na tela: a seleção é refeita sobre a base já carregada, sem baixar nada.
+    Só mudar a UF refaz a base. Município que a Receita não conhece fica fora do filtro e é
+    informado, sem derrubar a execução."""
     import rodar_mensal
 
     base_url, _fail, downloads = source_server
@@ -377,15 +380,26 @@ def test_rodar_mensal_filtro_da_tela_mudou_recarrega(
     baixados = len(downloads)
 
     gr.config["versao"], gr.config["filtroVersao"] = 2, 2
-    gr.config["filtro"]["municipios"] = ["Joinville", "CIDADE QUE NAO EXISTE"]
+    gr.config["filtro"]["municipios"] = ["Joinville", "Blumenau", "CIDADE QUE NAO EXISTE"]
     assert rodar_mensal.executar(["--mes", "2024-01"]) == 0  # sem --force
     with EstadoProspeccao(tmp_path / "estado.sqlite") as estado:
         ultima = estado.ultima_execucao()
     assert ultima is not None and ultima["status"] == "SEM_ENVIO"
     c = ultima["contagens"]
-    assert c["recarga_por_filtro"] is True and len(downloads) > baixados  # baixou e carregou de novo
+    assert len(downloads) == baixados and "recarga_base" not in c  # nada baixado de novo
     assert c["municipios_nao_reconhecidos"] == ["CIDADE QUE NAO EXISTE"]
-    assert c["exportadas"] == 3 and c["filtro_versao"] == 2
+    assert c["exportadas"] == 4 and c["filtro_versao"] == 2  # + 44444444 de Blumenau, sem recarga
+
+    # UF mudou: a base do mês é baixada e carregada de novo, só com a nova UF
+    gr.config["filtro"]["uf"], gr.config["filtro"]["municipios"] = "PR", []
+    assert rodar_mensal.executar(["--mes", "2024-01"]) == 0
+    with EstadoProspeccao(tmp_path / "estado.sqlite") as estado:
+        ultima = estado.ultima_execucao()
+    assert ultima is not None
+    c = ultima["contagens"]
+    assert c["recarga_base"] is True and len(downloads) > baixados and c["uf_base"] == "PR"
+    assert c["linhas_filtradas"]["estabelecimentos"] == 0 and c["exportadas"] == 0
+    gr.config["filtro"]["uf"] = "SC"
 
     # Nenhum município reconhecido: erro (senão viraria "a UF inteira")
     gr.config["filtro"]["municipios"] = ["CIDADE QUE NAO EXISTE"]

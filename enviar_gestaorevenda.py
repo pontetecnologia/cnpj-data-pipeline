@@ -280,8 +280,10 @@ def enviar(
     cfg: ConfigEnvio,
     pasta_backup: Path = Path("saida"),
     cliente: ClienteGestaoRevenda | None = None,
+    ao_lote: Callable[[ResultadoEnvio], None] | None = None,
 ) -> ResultadoEnvio:
-    """Envia em lotes, registra cada lote no estado local e grava o CSV de backup do que foi enviado."""
+    """Envia em lotes, registra cada lote no estado local e grava o CSV de backup do que foi enviado.
+    `ao_lote` é chamado depois de cada lote (andamento na tela local)."""
     cliente = cliente or ClienteGestaoRevenda(cfg)
     data_base = data_da_base(mes_base)
     res = ResultadoEnvio()
@@ -312,6 +314,8 @@ def enviar(
                 f"({corpo.get('bloqueados', 0)} bloqueadas), {corpo.get('duplicados', 0)} duplicadas, "
                 f"{corpo.get('erros', 0)} erros"
             )
+            if ao_lote is not None:
+                ao_lote(res)
     finally:
         # Backup mesmo se um lote falhar no meio: mostra exatamente o que chegou ao GestaoRevenda
         if enviadas:

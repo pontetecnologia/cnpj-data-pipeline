@@ -14,8 +14,13 @@ ERRO não entra, então o CNPJ volta a ser tentado na próxima execução.
 Status de uma execução: EM_ANDAMENTO (ou interrompida sem chegar ao fim, até a próxima execução
 marcá-la como INTERROMPIDA), OK, PARCIAL (--limite cortou a lista), SEM_ENVIO, FALHOU, INTERROMPIDA.
 
+Envios feitos pela tela local (tela_local.py) são execuções com modo 'tela': contam para "já
+enviado" (cnpjs_enviados), mas NÃO concluem o mês nem a 1ª execução do envio automático (ver
+ultima_concluida / ultima_com_status / ultima_execucao).
+
 `servico_verificacoes` guarda as verificações diárias do servico_prospeccao.py.
 `fila_gestaorevenda` guarda as execuções e o sinal que ainda não chegaram ao GestaoRevenda.
+`varreduras` guarda o histórico da tela local (filtros, contagens e o envio feito a partir dela).
 """
 
 from __future__ import annotations
@@ -43,7 +48,7 @@ CREATE TABLE IF NOT EXISTS execucoes (
     iniciada_em TEXT NOT NULL,
     finalizada_em TEXT,
     mes_base TEXT,
-    modo TEXT NOT NULL,              -- 'novos' | 'tudo'
+    modo TEXT NOT NULL,              -- 'novos' | 'tudo' | 'tela'
     status TEXT NOT NULL,            -- EM_ANDAMENTO | OK | PARCIAL | SEM_ENVIO | FALHOU | INTERROMPIDA
     contagens TEXT                   -- JSON com as contagens do log
 );
@@ -88,7 +93,23 @@ CREATE TABLE IF NOT EXISTS meta (
     chave TEXT PRIMARY KEY,
     valor TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS varreduras (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    em TEXT NOT NULL,
+    mes_base TEXT,
+    filtros TEXT NOT NULL,           -- JSON dos filtros da tela (para "Repetir")
+    resumo TEXT NOT NULL,            -- os filtros em português
+    encontradas INTEGER NOT NULL,
+    ja_enviadas INTEGER NOT NULL,
+    novas INTEGER NOT NULL,
+    execucao_id INTEGER REFERENCES execucoes(id),
+    envio TEXT                       -- JSON: resultado do envio feito a partir desta varredura
+);
 """
+
+MODOS = ("novos", "tudo", "tela")
+# Execuções do envio automático (rodar_mensal); as da tela ficam fora das regras do mês
+_SO_AUTOMATICO = "modo <> 'tela'"
 
 
 def _agora() -> str:
@@ -141,8 +162,8 @@ class EstadoProspeccao:
     # ── Execuções ─────────────────────────────────────────────────────────────
 
     def iniciar_execucao(self, mes_base: str | None, modo: str) -> int:
-        if modo not in ("novos", "tudo"):
-            raise ValueError("modo deve ser 'novos' ou 'tudo'")
+        if modo not in MODOS:
+            raise ValueError("modo deve ser 'novos', 'tudo' ou 'tela'")
         cur = self.conn.execute(
             "INSERT INTO execucoes (iniciada_em, mes_base, modo, status) VALUES (?, ?, ?, 'EM_ANDAMENTO')",
             (_agora(), mes_base, modo),
@@ -195,11 +216,17 @@ class EstadoProspeccao:
         """A execução mais recente que conclui o mês (ver mes_concluido), ou None."""
         status = ("OK", "SEM_ENVIO") if aceitar_sem_envio else ("OK",)
         marcadores = ",".join("?" * len(status))
-        return self._execucao_onde(f"mes_base = ? AND status IN ({marcadores})", (mes_base, *status))
+        return self._execucao_onde(
+            f"mes_base = ? AND status IN ({marcadores}) AND {_SO_AUTOMATICO}", (mes_base, *status)
+        )
 
     def ultima_com_status(self, *status: str) -> dict[str, Any] | None:
         marcadores = ",".join("?" * len(status))
-        return self._execucao_onde(f"status IN ({marcadores})", status)
+        return self._execucao_onde(f"status IN ({marcadores}) AND {_SO_AUTOMATICO}", status)
+
+    def ja_teve_envio_completo(self) -> bool:
+        """Já houve execução automática OK? (Até lá, a janela de abertura é 0 = todas.)"""
+        return self.ultima_com_status("OK") is not None
 
     def ultimo_id_execucao(self) -> int:
         row = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM execucoes").fetchone()
@@ -215,8 +242,8 @@ class EstadoProspeccao:
                 (_agora(), status, json.dumps(contagens, ensure_ascii=False), execucao_id),
             )
 
-    def ultima_execucao(self) -> dict[str, Any] | None:
-        return self._execucao_onde("1 = 1", ())
+    def ultima_execucao(self, incluir_tela: bool = False) -> dict[str, Any] | None:
+        return self._execucao_onde("1 = 1" if incluir_tela else _SO_AUTOMATICO, ())
 
     def _execucao_onde(self, where: str, params: tuple[Any, ...]) -> dict[str, Any] | None:
         row = self.conn.execute(
@@ -311,3 +338,60 @@ class EstadoProspeccao:
 
     def tamanho_fila(self) -> int:
         return int(self.conn.execute("SELECT COUNT(*) FROM fila_gestaorevenda").fetchone()[0])
+
+    # ── Tela local ────────────────────────────────────────────────────────────
+
+    def resultados_da_execucao(self, execucao_id: int) -> dict[str, int]:
+        """{IMPORTADO: n, DUPLICADO: n, ...} do que já foi gravado (lote a lote) nessa execução."""
+        rows = self.conn.execute(
+            "SELECT resultado, COUNT(*) FROM execucao_itens WHERE execucao_id = ? GROUP BY resultado",
+            (execucao_id,),
+        ).fetchall()
+        return {str(r[0]): int(r[1]) for r in rows}
+
+    def cnpjs_ja_enviados(self) -> list[str]:
+        return [str(r[0]) for r in self.conn.execute("SELECT cnpj FROM cnpjs_enviados")]
+
+    def registrar_varredura(
+        self, mes_base: str | None, filtros: dict[str, Any], resumo: str, contagens: dict[str, int]
+    ) -> int:
+        """Grava uma consulta da tela. Repetir a mesma consulta (mesmos filtros e mês, sem envio
+        depois) só atualiza a anterior, para o histórico não encher de linhas iguais."""
+        filtros_json = json.dumps(filtros, ensure_ascii=False, sort_keys=True)
+        valores = (_agora(), contagens["encontradas"], contagens["ja_enviadas"], contagens["novas"])
+        with self.conn:
+            ultima = self.conn.execute(
+                "SELECT id, mes_base, filtros, execucao_id FROM varreduras ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if ultima and ultima[1] == mes_base and ultima[2] == filtros_json and ultima[3] is None:
+                self.conn.execute(
+                    "UPDATE varreduras SET em = ?, encontradas = ?, ja_enviadas = ?, novas = ? WHERE id = ?",
+                    (*valores, ultima[0]),
+                )
+                return int(ultima[0])
+            cur = self.conn.execute(
+                "INSERT INTO varreduras (em, encontradas, ja_enviadas, novas, mes_base, filtros, resumo) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (*valores, mes_base, filtros_json, resumo),
+            )
+        return int(cur.lastrowid or 0)
+
+    def registrar_envio_varredura(self, varredura_id: int, execucao_id: int | None, envio: dict[str, Any]) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE varreduras SET execucao_id = ?, envio = ? WHERE id = ?",
+                (execucao_id, json.dumps(envio, ensure_ascii=False), varredura_id),
+            )
+
+    def varreduras(self, limite: int = 100) -> list[dict[str, Any]]:
+        chaves = ("id", "em", "mes_base", "filtros", "resumo", "encontradas", "ja_enviadas", "novas", "envio")
+        rows = self.conn.execute(
+            f"SELECT {', '.join(chaves)} FROM varreduras ORDER BY id DESC LIMIT ?", (limite,)
+        ).fetchall()
+        resultado: list[dict[str, Any]] = []
+        for row in rows:
+            item: dict[str, Any] = dict(zip(chaves, row, strict=True))
+            item["filtros"] = json.loads(item["filtros"])
+            item["envio"] = json.loads(item["envio"]) if item["envio"] else None
+            resultado.append(item)
+        return resultado

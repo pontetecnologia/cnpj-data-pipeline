@@ -217,14 +217,15 @@ def test_verificar_ligar_envio_reabre_o_mes(ambiente: dict[str, Any]) -> None:
     assert sp.verificar("servico", Event()) == sp.SEM_NOVIDADE
 
 
-def test_verificar_filtro_alterado_recarrega_na_proxima_verificacao(ambiente: dict[str, Any]) -> None:
+def test_verificar_filtro_alterado_refaz_a_selecao_na_proxima_verificacao(ambiente: dict[str, Any]) -> None:
     assert sp.verificar("servico", Event()) == sp.EXECUTADO
     assert ambiente["execucoes"][-1][1]["recarregar"] is False
-    # Mudou o município na tela: o mês já processado volta a rodar, baixando e carregando de novo
+    # Mudou o município na tela: o mês já processado volta a rodar, SEM forçar a recarga da base
+    # (rodar_mensal só baixa de novo se a UF da base mudou)
     ambiente["cfg"] = replace(REMOTA, municipios=("JOINVILLE", "BLUMENAU"), versao=4, filtro_versao=3)
     assert sp.verificar("servico", Event()) == sp.EXECUTADO
-    assert ambiente["execucoes"][-1][1]["recarregar"] is True
-    # Já recarregado com o filtro novo: nada a fazer
+    assert len(ambiente["execucoes"]) == 2 and ambiente["execucoes"][-1][1]["recarregar"] is False
+    # Já refeito com o filtro novo: nada a fazer
     assert sp.verificar("servico", Event()) == sp.SEM_NOVIDADE
     # Mudar só o horário ou o disco não muda o filtro
     ambiente["cfg"] = replace(ambiente["cfg"], horario=hora_do_dia(4, 0), disco_min_gb=30, versao=5)

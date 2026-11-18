@@ -2,7 +2,8 @@
 
 O GestaoRevenda guarda o histórico (Configurações → Prospecção Receita → Execuções), manda o aviso
 por e-mail pela conta escolhida na tela e cria uma Demanda Interna se o serviço ficar mais de 8
-dias sem dar sinal. Nenhuma senha de SMTP fica no pipeline.
+dias sem dar sinal. Nenhuma senha de SMTP fica no pipeline. Envios feitos pela tela local vão com
+origem "tela": entram no histórico, mas o GestaoRevenda não manda e-mail por eles.
 
 API Client do .env, escopo "prospeccao-execucoes" (só gravar execução e sinal):
     POST /prospeccao-receita/servico/execucoes   ao terminar cada execução (ou ao pulá-la)
@@ -97,7 +98,7 @@ def payload_execucao(
     status = execucao["status"] if execucao["status"] in STATUS_REPORTADOS else "FALHOU"
     detalhes: dict[str, Any] = {
         k: c[k]
-        for k in ("limite", "janela_inicio_atividade_meses", "csv_lista", "log", "a_enviar", "modo")
+        for k in ("limite", "janela_inicio_atividade_meses", "csv_lista", "log", "a_enviar", "modo", "filtros_tela")
         if c.get(k) is not None
     }
     if envio.get("backup"):

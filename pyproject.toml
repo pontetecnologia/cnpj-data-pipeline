@@ -11,6 +11,8 @@ dependencies = [
     "pyarrow>=17.0.0,<24.0.0",
     # exportar_prospeccao.py lê o Parquet com DuckDB
     "duckdb>=1.1.0,<3.0.0",
+    # tela_local.py: "Baixar em Excel"
+    "xlsxwriter>=3.2.0,<4.0.0",
 ]
 
 [project.scripts]
@@ -28,6 +30,8 @@ only-include = [
     # Adaptação GestaoRevenda (prospecção)
     "filtro.py", "estado_prospeccao.py", "exportar_prospeccao.py", "enviar_gestaorevenda.py", "rodar_mensal.py",
     "config_prospeccao.py", "aviso_gestaorevenda.py", "servico_prospeccao.py",
+    # Tela local (página servida pelo serviço)
+    "consulta_base.py", "tela_local.py", "tela",
 ]
 
 [tool.pytest.ini_options]

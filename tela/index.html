@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prospecção Receita</title>
+  <link rel="icon" href="/icone.ico">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="topo">
+    <div>
+      <h1>Prospecção Receita</h1>
+      <div id="base" class="base">Carregando…</div>
+    </div>
+    <button id="btn-atualizar" class="secundario" type="button">Atualizar base agora</button>
+  </header>
+
+  <div id="faixa-atualizacao" class="faixa oculto" role="status"></div>
+  <div id="faixa-envio" class="faixa oculto" role="status"></div>
+  <div id="aviso-gr" class="faixa alerta oculto"></div>
+
+  <nav class="abas">
+    <button type="button" data-aba="busca" class="ativa">Nova busca</button>
+    <button type="button" data-aba="historico">Histórico</button>
+  </nav>
+
+  <main>
+    <section id="aba-busca">
+      <form id="form-filtros" class="cartao filtros" autocomplete="off">
+        <div class="campo largo">
+          <label for="cnae-busca">Atividades (CNAE)</label>
+          <div id="cnae-chips" class="chips"></div>
+          <div class="busca">
+            <input id="cnae-busca" type="search" placeholder="Digite parte do nome ou o código. Ex.: supermercado ou 4711">
+            <ul id="cnae-sugestoes" class="sugestoes oculto"></ul>
+          </div>
+          <small>Sem nenhuma escolhida, entram todas as atividades.</small>
+        </div>
+
+        <div class="campo largo">
+          <label for="cidade-busca">Cidades <span class="uf">(estado: <strong id="uf">—</strong>)</span></label>
+          <div id="cidade-chips" class="chips"></div>
+          <div class="busca">
+            <input id="cidade-busca" type="search" placeholder="Digite o nome da cidade. Ex.: Blumenau">
+            <ul id="cidade-sugestoes" class="sugestoes oculto"></ul>
+          </div>
+          <small>Sem nenhuma escolhida, entram todas as cidades do estado.</small>
+        </div>
+
+        <div class="campo">
+          <span class="rotulo">Data de abertura</span>
+          <label class="opcao"><input type="radio" name="abertura" value="todas" checked> Todas</label>
+          <label class="opcao"><input type="radio" name="abertura" value="periodo"> Escolher período</label>
+          <div id="periodo" class="linha oculto">
+            <label>de <input type="date" id="abertura-de"></label>
+            <label>até <input type="date" id="abertura-ate"></label>
+            <span class="atalhos">
+              <button type="button" class="link" data-meses="6">últimos 6 meses</button>
+              <button type="button" class="link" data-meses="12">últimos 12 meses</button>
+            </span>
+          </div>
+        </div>
+
+        <div class="campo">
+          <span class="rotulo">Situação na Receita</span>
+          <div id="situacoes" class="linha"></div>
+          <small>Sem nenhuma marcada, entram todas.</small>
+        </div>
+
+        <div class="campo">
+          <span class="rotulo">Matriz ou filial</span>
+          <label class="opcao"><input type="radio" name="matriz" value="todas" checked> As duas</label>
+          <label class="opcao"><input type="radio" name="matriz" value="matriz"> Só matriz</label>
+          <label class="opcao"><input type="radio" name="matriz" value="filial"> Só filial</label>
+        </div>
+
+        <div class="campo">
+          <label class="opcao"><input type="checkbox" id="capital-ligado"> Filtrar por capital social</label>
+          <div id="capital" class="linha oculto">
+            <label>mínimo R$ <input id="capital-min" inputmode="decimal" placeholder="ex.: 50.000"></label>
+            <label>máximo R$ <input id="capital-max" inputmode="decimal" placeholder="sem limite"></label>
+          </div>
+        </div>
+
+        <div class="campo">
+          <label class="opcao"><input type="checkbox" id="excluir-mei"> Deixar de fora os MEI</label>
+        </div>
+
+        <div class="acoes">
+          <button id="btn-ver" class="principal" type="submit">Ver resultado</button>
+          <button id="btn-limpar" class="link" type="button">Limpar filtros</button>
+        </div>
+      </form>
+
+      <section id="resultado" class="cartao oculto" aria-live="polite"></section>
+    </section>
+
+    <section id="aba-historico" class="oculto">
+      <div class="cartao">
+        <h2>Buscas anteriores</h2>
+        <p class="dica">"Repetir" refaz a busca com a base atual.</p>
+        <div class="rolagem"><table id="tabela-historico"></table></div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="dlg">
+    <form method="dialog" id="dlg-form">
+      <h2 id="dlg-titulo"></h2>
+      <div id="dlg-corpo"></div>
+      <div class="acoes direita">
+        <button type="button" id="dlg-cancelar" class="secundario">Cancelar</button>
+        <button type="button" id="dlg-ok" class="principal">OK</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="mensagem" class="toast oculto" role="alert"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

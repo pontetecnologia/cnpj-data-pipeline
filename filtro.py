@@ -1,11 +1,12 @@
 """Filtro de prospecção aplicado durante a carga.
 
-O serviço e o rodar_mensal montam o filtro a partir da tela do GestaoRevenda
-(config_prospeccao.ConfigProspeccao.filtro). Rodando o pipeline original (main.py) direto, ele
-liga com PROSPECCAO_FILTRO=true e lê FILTRO_* (from_env). Com ele ligado:
+O serviço e o rodar_mensal carregam a "base rápida" com FiltroProspeccao.base(uf): todos os
+estabelecimentos da UF, de qualquer situação, CNAE e data. A tela local e o envio automático
+filtram essa base depois, por consulta (DuckDB), sem baixar de novo. Rodando o pipeline original
+(main.py) direto, o filtro liga com PROSPECCAO_FILTRO=true e lê FILTRO_* (from_env). Com ele ligado:
 
 - estabelecimentos são filtrados por situação cadastral, CNAE principal, UF, município e data
-  mínima de início de atividade;
+  mínima de início de atividade (situações ou CNAEs vazios = todos);
 - empresas e dados_simples são carregados só para os CNPJs básicos que sobraram em
   estabelecimentos (por isso estabelecimentos passa a ser processado ANTES deles);
 - sócios não são baixados nem carregados.
@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
 CNAES_PADRAO = ("4711-3/02", "4712-1/00", "4711-3/01", "4744-0/99", "4744-0/01", "4530-7/03", "4789-0/04")
 SITUACOES_PADRAO = ("02",)  # 02 = ativa
 MESES_PADRAO = 12
+UF_BASE_PADRAO = "SC"  # UF da base rápida quando a tela do GestaoRevenda não define uma
 
 # Tipos de arquivo afetados pelo filtro
 TIPO_ESTABELECIMENTOS = "ESTABELE"
@@ -103,8 +105,14 @@ class FiltroProspeccao:
     # reconhecido, ainda é erro (senão o filtro viraria "a UF inteira").
     tolerar_municipios: bool = False
     municipios_nao_reconhecidos: list[str] = field(default_factory=list)
+    _basicos: pl.DataFrame | None = field(default=None, repr=False, compare=False)
 
     # ── Configuração ──────────────────────────────────────────────────────────
+
+    @classmethod
+    def base(cls, uf: str) -> FiltroProspeccao:
+        """Base rápida: a UF inteira, todas as situações, CNAEs e datas."""
+        return cls(situacoes=set(), cnaes=set(), uf=uf.strip().upper(), meses_inicio_atividade=0)
 
     @classmethod
     def from_env(cls) -> FiltroProspeccao | None:
@@ -199,6 +207,8 @@ class FiltroProspeccao:
 
     def assinatura(self) -> str:
         """Identifica a configuração do filtro (sem a data de hoje, para retomar no dia seguinte)."""
+        if not (self.situacoes or self.cnaes or self.municipios_config or self.meses_inicio_atividade):
+            return f"base;uf={self.uf or ''}"
         return (
             f"situacao={','.join(sorted(self.situacoes))};cnaes={','.join(sorted(self.cnaes))};"
             f"uf={self.uf or ''};municipios={','.join(sorted(normalizar_nome(m) for m in self.municipios_config))};"
@@ -208,8 +218,8 @@ class FiltroProspeccao:
     def descrever(self) -> str:
         data_min = self.data_inicio_minima
         return (
-            f"situação={','.join(sorted(self.situacoes))}; "
-            f"CNAEs={','.join(sorted(self.cnaes))}; "
+            f"situação={','.join(sorted(self.situacoes)) or 'todas'}; "
+            f"CNAEs={','.join(sorted(self.cnaes)) or 'todos'}; "
             f"UF={self.uf or 'todas'}; "
             f"municípios={','.join(self.municipios_config) or 'todos'}; "
             f"início de atividade >= {data_min.isoformat() if data_min else 'sem limite'}"
@@ -221,9 +231,11 @@ class FiltroProspeccao:
         return file_type in TIPOS_IGNORADOS
 
     def expressao_estabelecimentos(self, dtype_data: pl.DataType | None = None) -> pl.Expr:
-        expr = pl.col("situacao_cadastral").is_in(sorted(self.situacoes)) & pl.col("cnae_fiscal_principal").is_in(
-            sorted(self.cnaes)
-        )
+        expr = pl.lit(True)
+        if self.situacoes:
+            expr = expr & pl.col("situacao_cadastral").is_in(sorted(self.situacoes))
+        if self.cnaes:
+            expr = expr & pl.col("cnae_fiscal_principal").is_in(sorted(self.cnaes))
         if self.uf:
             expr = expr & (pl.col("uf") == self.uf)
         if self.municipios_config:
@@ -249,7 +261,12 @@ class FiltroProspeccao:
                 raise RuntimeError(
                     f"{file_type}: CNPJs básicos filtrados ainda não carregados — estabelecimentos tem que vir antes"
                 )
-            return df.filter(pl.col("cnpj_basico").is_in(self.cnpjs_basicos))
+            # Base rápida: milhões de CNPJs básicos; a tabela é montada uma vez, não a cada lote
+            if self._basicos is None or self._basicos.height != len(self.cnpjs_basicos):
+                self._basicos = pl.DataFrame(
+                    {"cnpj_basico": sorted(self.cnpjs_basicos)}, schema={"cnpj_basico": pl.String}
+                )
+            return df.join(self._basicos, on="cnpj_basico", how="semi")
         return df
 
 

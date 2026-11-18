@@ -10,8 +10,11 @@ histórico e manda o e-mail.
 
 - Computador desligado no horário: a verificação do dia roda 10 min depois de ligar.
 - "Mês processado" = há execução OK para ele (ou SEM_ENVIO, enquanto o envio estiver desligado),
-  feita com o filtro atual da tela. Filtro alterado → o mês é baixado e recarregado na próxima
-  verificação programada (nunca na hora de salvar a tela).
+  feita com o filtro atual da tela. Filtro alterado → a seleção do mês é refeita sobre a base já
+  carregada na próxima verificação programada (nunca na hora de salvar a tela); só mudar a UF faz
+  baixar a base de novo.
+- Tela local (tela_local.py): o serviço também atende a página http://127.0.0.1:8765, que o
+  ícone "Prospecção Receita" da área de trabalho abre. Só aceita conexões deste computador.
 - Receita fora do ar ou outra execução em andamento: nova tentativa a cada 60 min, até 3 no dia.
 - Disco: exige o mínimo da tela (padrão 25 GB), descontado o que já está em TEMP_DIR.
 - No .env ficam só GR_API_URL, GR_CLIENT_ID e GR_CLIENT_SECRET (relidos a cada ciclo).
@@ -201,9 +204,12 @@ def rodar_fluxo(
     limite: int | None = None,
     recarregar: bool = False,
     console: bool = False,
+    so_base: bool = False,
 ) -> int:
     """Roda rodar_mensal.py --mes <mes> num subprocesso e devolve o código de saída."""
     cmd = [sys.executable, str(RAIZ / "rodar_mensal.py"), "--mes", mes]
+    if so_base:
+        cmd.append("--so-base")
     if sem_envio:
         cmd.append("--sem-envio")
     if limite is not None:
@@ -321,9 +327,11 @@ def _verificar(
             _avisar(estado, cfg, envio_desligado, mes)
             return SEM_NOVIDADE
         antes = estado.ultimo_id_execucao()
-    if mudou and not recarregar:
-        logger.info(f"Filtro alterado na tela (configuração v{cfg.versao}) — o mês {mes} será baixado e recarregado")
-        recarregar = True
+    if mudou:
+        logger.info(
+            f"Filtro alterado na tela (configuração v{cfg.versao}) — refazendo a seleção do mês {mes} "
+            "(a base só é baixada de novo se a UF mudou)"
+        )
     situacao = "reprocessando (--forcar)" if concluida and not mudou else "pendente"
     logger.info(f"Mês mais recente da Receita: {mes} — {situacao}")
 
@@ -405,8 +413,15 @@ def atualizar_config(atual: ConfigProspeccao | None) -> ConfigProspeccao:
     return cfg
 
 
-def laco(parar: Event, agora: type[datetime] = datetime) -> None:
+def laco(parar: Event, agora: type[datetime] = datetime, tela: bool = True) -> None:
     inicio = agora.now()
+    if tela:
+        try:
+            import tela_local
+
+            tela_local.iniciar_em_segundo_plano(parar)
+        except Exception as e:  # a tela nunca derruba o serviço
+            logger.exception(f"Tela local não iniciou: {e}")
     cfg = atualizar_config(None)
     servico = ConfigServico.de(cfg)
     ultima_busca = agora.now()
@@ -492,6 +507,17 @@ def mostrar_status() -> int:
     proxima = proxima_verificacao(agora, servico, registros)
     print(f"  Verificação diária às {servico.horario:%H:%M}; próxima: {proxima:%Y-%m-%d %H:%M}")
     print(f"  Disco mínimo: {servico.disco_min_gb:g} GB · avisos na fila para o GestaoRevenda: {fila}")
+    from consulta_base import info_base, mes_por_extenso
+
+    base = info_base(Path(config_pipeline().parquet_output_dir))
+    if base is None:
+        print(f"  Base rápida: nenhuma ainda (UF {cfg.uf_base})")
+    else:
+        print(
+            f"  Base rápida: {mes_por_extenso(base.mes)}, UF {base.uf or '?'}, {base.estabelecimentos:,} "
+            f"estabelecimentos, {base.tamanho_bytes / 1024**2:,.0f} MB ({', '.join(base.meses_guardados)})"
+        )
+    print('  Tela local: http://127.0.0.1:8765 (ícone "Prospecção Receita" na área de trabalho)')
     print("\nÚltimas verificações:")
     for v in verificacoes or [{"em": "-", "origem": "", "mes_receita": "", "resultado": "(nenhuma)", "detalhe": ""}]:
         print(f"  {v['em']}  {v['origem']:<8} {v['mes_receita'] or '':<8} {v['resultado']:<19} {v['detalhe'] or ''}")

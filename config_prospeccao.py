@@ -23,7 +23,15 @@ from datetime import time as hora_do_dia
 from pathlib import Path
 from typing import Any, cast
 
-from filtro import CNAES_PADRAO, MESES_PADRAO, SITUACOES_PADRAO, FiltroProspeccao, normalizar_cnae, normalizar_situacao
+from filtro import (
+    CNAES_PADRAO,
+    MESES_PADRAO,
+    SITUACOES_PADRAO,
+    UF_BASE_PADRAO,
+    FiltroProspeccao,
+    normalizar_cnae,
+    normalizar_situacao,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -126,9 +134,19 @@ class ConfigProspeccao:
             tolerar_municipios=True,
         )
 
+    @property
+    def uf_base(self) -> str:
+        """UF da base rápida (o que a carga mensal guarda): a UF da tela, ou SC."""
+        return self.uf or UF_BASE_PADRAO
+
+    def filtro_base(self) -> FiltroProspeccao:
+        """Filtro da CARGA: a UF inteira. Só mudar a UF exige baixar o mês de novo."""
+        return FiltroProspeccao.base(self.uf_base)
+
     def chave_filtro(self) -> str:
-        """Identifica o filtro da tela (CNAE/UF/município/situação/abertura). Mudou → o serviço
-        recarrega o mês na próxima verificação programada."""
+        """Identifica o filtro do envio automático (CNAE/UF/município/situação/abertura). Mudou →
+        o serviço refaz a seleção do mês na próxima verificação programada (sem baixar de novo,
+        salvo se a UF mudou)."""
         return self.filtro().assinatura()
 
     def descrever_origem(self) -> str:

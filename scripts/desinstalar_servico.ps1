@@ -8,7 +8,7 @@
         powershell -ExecutionPolicy Bypass -File scripts\desinstalar_servico.ps1
 
     Para o serviço (uma execução em andamento é interrompida e retomada na próxima vez que rodar),
-    remove o serviço e as permissões da conta virtual. Mantém estado\, logs\, saida\, parquet\ e o
+    remove o serviço, as permissões da conta virtual e o ícone da área de trabalho. Mantém estado\, logs\, saida\, parquet\ e o
     .env: reinstalar continua de onde parou, sem reenviar nada.
 #>
 $ErrorActionPreference = 'Stop'
@@ -46,6 +46,13 @@ Write-Host '==> Removendo as permissões da conta virtual'
 $alvos = @($raiz, (Join-Path $raiz '.env')) + (@('logs', 'estado', 'saida', 'temp', 'parquet') | ForEach-Object { Join-Path $raiz $_ })
 foreach ($alvo in $alvos) {
     if (Test-Path $alvo) { & icacls.exe $alvo /remove:g $conta /C /Q 2>$null | Out-Null }
+}
+
+# Ícone da tela na área de trabalho de todos os usuários
+$atalho = Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'Prospecção Receita.url'
+if (Test-Path $atalho) {
+    Write-Host '==> Removendo o ícone "Prospecção Receita" da área de trabalho'
+    Remove-Item $atalho -Force
 }
 
 Write-Host ''

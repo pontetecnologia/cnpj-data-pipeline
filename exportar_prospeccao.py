@@ -124,6 +124,8 @@ def where_filtro(filtro: FiltroProspeccao | None, ph: str) -> tuple[str, list[An
     params: list[Any] = []
 
     def em(coluna: str, valores: set[str]) -> None:
+        if not valores:  # vazio = todos (base rápida)
+            return
         partes.append(f"{coluna} IN ({', '.join([ph] * len(valores))})")
         params.extend(sorted(valores))
 
@@ -138,7 +140,7 @@ def where_filtro(filtro: FiltroProspeccao | None, ph: str) -> tuple[str, list[An
     if (data_min := filtro.data_inicio_minima) is not None:
         partes.append(f"e.data_inicio_atividade >= {ph}")
         params.append(data_min)
-    return "WHERE " + " AND ".join(partes), params
+    return ("WHERE " + " AND ".join(partes)) if partes else "", params
 
 
 # ── Leitura ───────────────────────────────────────────────────────────────────
@@ -218,6 +220,12 @@ def _views_duckdb(con: Any, pasta: Path) -> bool:
     return True
 
 
+def pasta_base_mais_recente(raiz: Path) -> Path | None:
+    """Pasta do mês mais recente com carga COMPLETA (o manifest.json só é gravado no fim)."""
+    meses = sorted(p for p in raiz.glob("????-??") if p.is_dir() and (p / "manifest.json").exists())
+    return meses[-1] if meses else None
+
+
 def _ler_parquet(config: Config, filtro: FiltroProspeccao | None) -> tuple[list[dict], dict[str, str], str | None]:
     import duckdb
 
@@ -289,7 +297,7 @@ def _data_iso(valor: Any) -> str | None:
     return f"{texto[:4]}-{texto[4:6]}-{texto[6:8]}" if re.fullmatch(r"\d{8}", texto) else texto
 
 
-def montar_linha(bruta: dict, cnaes: dict[str, str], mes_base: str | None) -> dict:
+def montar_linha(bruta: dict[str, Any], cnaes: dict[str, str], mes_base: str | None) -> dict[str, Any]:
     cnpj = f"{bruta['cnpj_basico']}{bruta['cnpj_ordem']}{bruta['cnpj_dv']}"
     logradouro = " ".join(p for p in (_limpo(bruta["tipo_logradouro"]), _limpo(bruta["logradouro"])) if p) or None
     cep = formatar_cep(bruta["cep"])
@@ -398,9 +406,9 @@ def main(argv: list[str] | None = None) -> int:
     logger.info(f"Filtro: {cfg.descrever_origem()}")
     filtro = cfg.filtro()
     if config.output_format == "parquet":
-        meses = sorted(p.name for p in Path(config.parquet_output_dir).glob("????-??") if p.is_dir())
-        if meses:  # rodar_mensal grava uma pasta por mês: exporta a mais recente
-            config = replace(config, parquet_output_dir=str(Path(config.parquet_output_dir) / meses[-1]))
+        pasta = pasta_base_mais_recente(Path(config.parquet_output_dir))
+        if pasta is not None:  # rodar_mensal grava uma pasta por mês: exporta a mais recente
+            config = replace(config, parquet_output_dir=str(pasta))
     with EstadoProspeccao() as estado:
         linhas, selecionadas, mes_base = exportar(config, filtro, estado, tudo=args.tudo)
     saida = args.saida or Path("saida") / f"prospeccao_{mes_base or 'sem-mes'}.csv"
